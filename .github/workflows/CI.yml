@@ -26,5 +26,6 @@ jobs:
     uses: "SciML/.github/.github/workflows/tests.yml@v1"
     with:
       julia-version: "${{ matrix.version }}"
+      num-threads: "4"
       coverage: true
     secrets: "inherit"

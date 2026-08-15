@@ -421,7 +421,7 @@ end
 
 # The threaded reduction partitions its work independently of the thread count, so the
 # threaded and serial paths must agree to the bit; with one thread the two paths coincide
-# and this only checks the API (the CI workflow runs a single thread).
+# and this only checks the API (CI runs with four threads).
 @testset "threaded reduction is bit-identical to the serial one" begin
     LHL = LHLFactorization
     nthr = Threads.nthreads()
@@ -457,7 +457,14 @@ end
             @test x1 == x2
             @test bwd(σ * I + τ * J, x2, b) <= 20n * eps(T)
         end
-        @test alloc_lhl(w2, J, balance) == 0
+        # Before Julia 1.12, `@batch` code compiled into the package image pays 112 bytes
+        # per region when run on more than one thread (Polyester's cfunction trampoline
+        # is re-created per call there); 1.12 is allocation-free.
+        if VERSION >= v"1.12" || nthr == 1
+            @test alloc_lhl(w2, J, balance) == 0
+        else
+            @test alloc_lhl(w2, J, balance) <= 112 * 3n
+        end
     end
     # small sizes and the zero-pivot / interchange branches on the blocked kernel directly,
     # with the thread count forced (chunks then hold few rows each)

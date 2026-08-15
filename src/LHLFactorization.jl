@@ -3126,7 +3126,10 @@ end
 
 # Compile the reduction, shift and solve for both float types into the package image
 # (`ccall(:jl_generating_output)`: only while precompiling); the blocked path with two
-# chunks so that the `@batch` bodies are compiled as well.
+# chunks so that the `@batch` bodies are compiled as well.  (Before Julia 1.12 a `@batch`
+# compiled into the image allocates 112 bytes per call on more than one thread — the
+# cfunction trampoline of Polyester's closure is re-created each time; the alternative,
+# not precompiling, costs 6 s at the first `lhl`.)
 if ccall(:jl_generating_output, Cint, ()) == 1
     let
         for T in (Float64, Float32)
