@@ -1,7 +1,7 @@
 name = "LHLFactorization"
 uuid = "2faa5264-e118-4071-8864-e10559f68c7c"
 authors = ["SciML"]
-version = "1.0.0"
+version = "1.1.0"
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
