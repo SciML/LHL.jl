@@ -51,6 +51,7 @@ module LHLFactorization
 
 using LinearAlgebra
 using LinearAlgebra: BlasInt, checksquare
+using Polyester: @batch
 
 export LHLWorkspace, LHLShift, lhl, lhl!, lhl_reduce!, lhl_shift!, lhl_ldiv!, lhl_refine!,
     applyZ!, applyZinv!
@@ -172,7 +173,7 @@ function LHLWorkspace{T}(n::Integer; shift::Type = T) where {T}
     return LHLWorkspace{T, Tr, TG}(
         F, view(F, 1:n, 1:n), Vector{T}(undef, _lhl_lpack_len(n, W)),
         Vector{Int}(undef, max(n - 2, 0)), collect(1:n), collect(1:n), ones(Tr, n), ones(Tr, n),
-        Matrix{T}(undef, n, n), Vector{T}(undef, n), Vector{T}(undef, _lhl_pack_len(n)),
+        Matrix{T}(undef, n, n), Vector{T}(undef, n), Vector{T}(undef, _lhl_pack_len(n, T)),
         zeros(T, n + W), LHLShift{TG}(n), false, n
     )
 end
@@ -241,8 +242,17 @@ function _lhl_ld(n::Int, ::Type{T}) where {T}
 end
 
 # Scratch for the blocked reduction's packed GEMM/TRSM operands (`_lhl_gemm_micro!`,
-# `_lhl_trsm_block!`).
-_lhl_pack_len(n::Int) = (nb = _lhl_panel_width(n); nb * (n + 4) + nb * nb)
+# `_lhl_trsm_block!`) and, on the Float32/Float64 path, the GEMV partials of the column
+# groups plus per-chunk and per-group tables (`_lhl_panel_steps!`).
+function _lhl_pack_len(n::Int, ::Type{T}) where {T}
+    nb = _lhl_panel_width(n)
+    len = nb * (n + 4) + nb * nb
+    if T <: Union{Float32, Float64}
+        P = cld(n, _LHL_GEMV_GROUP)
+        len = max(len, P * _lhl_ld(n, T) + 4nb * Threads.nthreads() + 2nb * P)
+    end
+    return len
+end
 
 function _lhl_resize!(ws::LHLWorkspace{T}, n::Int) where {T}
     n == ws.n && size(ws.factors, 1) == n && return ws
@@ -257,7 +267,7 @@ function _lhl_resize!(ws::LHLWorkspace{T}, n::Int) where {T}
     resize!(ws.scale, n)
     resize!(ws.iscale, n)
     resize!(ws.work, n)
-    resize!(ws.pack, _lhl_pack_len(n))
+    resize!(ws.pack, _lhl_pack_len(n, T))
     resize!(ws.xbuf, n + W)
     _lhl_resize!(ws.shift, n)
     ws.n = n
@@ -336,13 +346,16 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    lhl_reduce!(ws, J, balance) -> ws
+    lhl_reduce!(ws, J, balance, thread = Val(true)) -> ws
 
 Reduce `J` to upper Hessenberg form by Gaussian similarity transformations with partial
-pivoting, into `ws`.  `J` is not modified.
+pivoting, into `ws`.  `J` is not modified.  `thread` (`Val(true)`/`Val(false)` or a
+`Bool`) allows the reduction to run its trailing updates on Polyester threads; see
+[`lhl`](@ref).
 """
-function lhl_reduce!(ws::LHLWorkspace{T}, J::AbstractMatrix, balance::Bool) where {T}
+function lhl_reduce!(ws::LHLWorkspace{T}, J::AbstractMatrix, balance::Bool, thread = Val(true)) where {T}
     n = LinearAlgebra.checksquare(J)
+    nt = _lhl_nthreads(thread, n, T)
     _lhl_resize!(ws, n)
     A = ws.fstore
     if size(A, 1) == n
@@ -361,14 +374,11 @@ function lhl_reduce!(ws::LHLWorkspace{T}, J::AbstractMatrix, balance::Bool) wher
         fill!(ws.iscale, one(eltype(ws.iscale)))
     end
     if n >= _lhl_block_min(T)
-        _lhl_reduce_blocked!(A, ws.ipiv, ws.Ht, ws.work, ws.pack, _lhl_panel_width(n))
+        _lhl_reduce_blocked!(A, ws.ipiv, ws.Ht, ws.work, ws.pack, _lhl_panel_width(n), nt)
     else
         _lhl_reduce_unblocked!(A, ws.ipiv)
     end
-    Ht = ws.Ht
-    @inbounds for j in 1:n, i in 1:min(j + 1, n)
-        Ht[j, i] = A[i, j]
-    end
+    _lhl_ht_fill!(ws.Ht, A, n, nt)
     _lhl_lpack!(ws.Lp, A, n, Val(_lhl_tilew(T)))
     perm = ws.perm
     iperm = ws.iperm
@@ -683,13 +693,71 @@ _lhl_block_min(::Type{Float32}) = 1024
 _lhl_block_min(::Type{T}) where {T} = 768
 _lhl_panel_width(n::Int) = 16
 
+# ---------------------------------------------------------------------------
+# Threading.  `thread` is `Val(true)`/`Val(false)` or a `Bool`.  Only the blocked
+# Float32/Float64 path threads, and the choice of path does not depend on the thread
+# count.  The row and column partitions below depend on the sizes only, never on the
+# thread count, every element is written by exactly one chunk with the arithmetic of the
+# serial kernel, and reductions across chunks follow a fixed order, so the result is
+# bit-identical for any `Threads.nthreads()`.  The unblocked path is not threaded: its
+# row-block sweep splits by rows, and the per-step row interchange then moves two rows'
+# worth of cache lines between the cores every step, which measured slower than serial.
+# ---------------------------------------------------------------------------
+_lhl_thread_flag(::Val{B}) where {B} = B
+_lhl_thread_flag(b::Bool) = b
+_lhl_thread_min(::Type{T}) where {T} = T <: Union{Float32, Float64} ? _lhl_block_min(T) : typemax(Int)
+# Rows below which a panel step's row work stays on one thread.
+_lhl_thread_rows(::Type{T}) where {T} = 128
+_lhl_line(::Type{T}) where {T} = 64 ÷ sizeof(T)
+
+# Chunks the reduction hands to `@batch`; 1 is the serial path.
+function _lhl_nthreads(thread, n::Int, ::Type{T}) where {T}
+    _lhl_thread_flag(thread) || return 1
+    nt = Threads.nthreads()
+    (nt > 1 && n >= _lhl_thread_min(T)) || return 1
+    return nt
+end
+
+# Chunk t of nt over r0:r1 in whole blocks of the absolute grid 1+g(b-1):gb (the first
+# and last block clipped to r0:r1), balanced to a block; chunks past the block count are
+# empty (ia > ib).
+@inline function _lhl_chunk(r0::Int, r1::Int, t::Int, nt::Int, g::Int)
+    b0 = (r0 - 1) ÷ g
+    nb = (r1 - 1) ÷ g - b0 + 1
+    q, r = divrem(nb, nt)
+    a = (t - 1) * q + min(t - 1, r)
+    b = t * q + min(t, r)
+    a == b && return (1, 0)
+    return (max(r0, 1 + (b0 + a) * g), min(r1, (b0 + b) * g))
+end
+
 function _lhl_reduce_blocked!(
         A::AbstractMatrix{T}, ipiv, B0::AbstractMatrix{T},
-        w::AbstractVector{T}, pack::AbstractArray{T}, nb::Int
+        w::AbstractVector{T}, pack::AbstractArray{T}, nb::Int, nt::Int = 1
     ) where {T}
     n = size(A, 2)
+    have = false
     @inbounds for k0 in 1:nb:(n - 2)
         kb = min(k0 + nb - 1, n - 2)
+        have = _lhl_panel_steps!(A, ipiv, B0, w, pack, k0, kb, nb, nt, have)
+        if kb + 2 <= n
+            _lhl_swap_rows!(A, ipiv, k0, kb, kb + 2, n, nt)
+            _lhl_trsm_block!(A, k0, kb, pack, nt)
+            _lhl_gemm!(A, kb + 2, n, k0, kb, k0 + 1, kb + 2, kb + 2, n, -one(T), pack, nt)
+        end
+        _lhl_top_gemm!(A, k0, kb, nb, pack, nt)
+    end
+    _lhl_swap_deferred!(A, ipiv, nb, nt)
+    return A
+end
+
+# The steps k0:kb of one panel; returns whether the pivot search of step kb+1 has been done
+# ahead (`_lhl_pivot_blocks!`, pointer path only).
+function _lhl_panel_steps!(
+        A::AbstractMatrix{T}, ipiv, B0, w, pack, k0::Int, kb::Int, nb::Int, nt::Int, have::Bool
+    ) where {T}
+    n = size(A, 2)
+    @inbounds begin
         for j in (k0 + 1):(kb + 1)
             @simd for i in 1:n
                 B0[i, j - k0] = A[i, j]
@@ -707,33 +775,8 @@ function _lhl_reduce_blocked!(
             end
             ipiv[k] = p
             if p != k + 1
-                for j in k0:(kb + 1)
-                    A[k + 1, j], A[p, j] = A[p, j], A[k + 1, j]
-                end
-                if p <= kb + 1
-                    for i in 1:n
-                        A[i, k + 1], A[i, p] = A[i, p], A[i, k + 1]
-                        B0[i, k + 1 - k0], B0[i, p - k0] = B0[i, p - k0], B0[i, k + 1 - k0]
-                    end
-                else
-                    for i in 1:n
-                        t = A[i, p]
-                        A[i, p] = B0[i, k + 1 - k0]
-                        B0[i, k + 1 - k0] = t
-                        A[i, k + 1] = t
-                    end
-                    for kk in k0:k
-                        q = ipiv[kk]
-                        q != kk + 1 && ((A[kk + 1, k + 1], A[q, k + 1]) = (A[q, k + 1], A[kk + 1, k + 1]))
-                    end
-                    for kk in k0:(k - 1)
-                        x = A[kk + 1, k + 1]
-                        iszero(x) && continue
-                        @simd for i in (kk + 2):n
-                            A[i, k + 1] -= A[i, kk] * x
-                        end
-                    end
-                end
+                A[k + 1, k], A[p, k] = A[p, k], A[k + 1, k]
+                _lhl_step_swaps!(A, B0, ipiv, k0, kb, k, p)
             end
             piv = A[k + 1, k]
             iszero(piv) && continue
@@ -754,44 +797,562 @@ function _lhl_reduce_blocked!(
                     A[i, k + 1] += vj * A[i, j]
                 end
             end
-            if kb + 2 <= n
-                for i in (k0 + 1):n
-                    w[i] = zero(T)
+            kb + 2 <= n || continue
+            _lhl_gemv_cols!(w, A, k, k0 + 1, n, kb + 2, n)
+            for kk in k0:k
+                q = ipiv[kk]
+                q != kk + 1 && ((w[kk + 1], w[q]) = (w[q], w[kk + 1]))
+            end
+            for kk in k0:k
+                x = w[kk + 1]
+                iszero(x) && continue
+                @simd for i in (kk + 2):n
+                    w[i] -= A[i, kk] * x
                 end
-                _lhl_gemv_cols!(w, A, k, k0 + 1, n, kb + 2, n)
-                for kk in k0:k
-                    q = ipiv[kk]
-                    q != kk + 1 && ((w[kk + 1], w[q]) = (w[q], w[kk + 1]))
+            end
+            @simd for i in (k0 + 1):n
+                A[i, k + 1] += w[i]
+            end
+        end
+    end
+    return false
+end
+
+# The interchange of step k (rows/columns k+1 and p) with column k already swapped: the
+# other panel columns' rows, then the columns — within the panel a plain exchange (with
+# the B0 copies), otherwise the pulled column enters, the pushed one leaves in its
+# pre-panel state, and the pulled column receives the panel's interchanges and left
+# transforms it has missed.
+function _lhl_step_swaps!(A, B0, ipiv, k0::Int, kb::Int, k::Int, p::Int)
+    n = size(A, 2)
+    @inbounds begin
+        for j in k0:(kb + 1)
+            j == k && continue
+            A[k + 1, j], A[p, j] = A[p, j], A[k + 1, j]
+        end
+        if p <= kb + 1
+            for i in 1:n
+                A[i, k + 1], A[i, p] = A[i, p], A[i, k + 1]
+                B0[i, k + 1 - k0], B0[i, p - k0] = B0[i, p - k0], B0[i, k + 1 - k0]
+            end
+        else
+            for i in 1:n
+                t = A[i, p]
+                A[i, p] = B0[i, k + 1 - k0]
+                B0[i, k + 1 - k0] = t
+                A[i, k + 1] = t
+            end
+            for kk in k0:k
+                q = ipiv[kk]
+                q != kk + 1 && ((A[kk + 1, k + 1], A[q, k + 1]) = (A[q, k + 1], A[kk + 1, k + 1]))
+            end
+            for kk in k0:(k - 1)
+                x = A[kk + 1, k + 1]
+                iszero(x) && continue
+                @simd for i in (kk + 2):n
+                    A[i, k + 1] -= A[i, kk] * x
                 end
-                for kk in k0:k
-                    x = w[kk + 1]
-                    iszero(x) && continue
-                    @simd for i in (kk + 2):n
-                        w[i] -= A[i, kk] * x
+            end
+        end
+    end
+    return nothing
+end
+
+# Pointer path.  Per step the main thread only reads a few dozen elements and writes
+# tables; two `@batch` regions do the rest.  A: column groups of the trailing block scale
+# their rows of the multiplier column and form their GEMV partial (`_lhl_gemv_partials!`;
+# a pulled column is read from its B0 copy).  B: row chunks apply the interchange, the
+# panel's left and right transforms and the sum of the partials to their rows, each also
+# forms — redundantly, from the same partials — the ≤ 2nb w-values the correction's
+# triangle needs, so it can finish the correction and add into column k+1 on its rows,
+# and scans its rows of column k+1 for the next step's pivot (`_lhl_pivot_blocks!`), in
+# blocks of eight rows the main thread combines in order.  Every partition is fixed by
+# n, k0, k, so the bits do not depend on the thread count; nt = 1 runs the same code.
+# Tables live in B0[:, nb+1:nb+8]:
+#   nb+1 catch-up x's · nb+2 pivot row (post-swap) · nb+3/nb+4 rows k+1/p pre-swap ·
+#   nb+5/nb+6 the pulled column's overridden values/rows · nb+7/nb+8 pivot blocks ·
+#   nb+9 the rows of the correction's triangle and their swap partners.
+# `pack` holds the GEMV partials, then per-chunk scratch, then the groups' gather table.
+function _lhl_panel_steps!(
+        A::StridedMatrix{T}, ipiv::Vector{Int}, B0::Matrix{T}, w::Vector{T}, pack::Array{T},
+        k0::Int, kb::Int, nb::Int, nt::Int, have::Bool
+    ) where {T <: Union{Float32, Float64}}
+    n = size(A, 2)
+    ldB = size(B0, 1)
+    P = max(cld(n - kb - 1, _LHL_GEMV_GROUP), 1)
+    ldp = _lhl_ld(n - k0, T)
+    if stride(A, 1) != 1 || size(B0, 2) < nb + 9 || ldB < n || length(pack) < P * ldp + 4nb * nt + 2nb * P
+        return invoke(
+            _lhl_panel_steps!, Tuple{AbstractMatrix{T}, Any, Any, Any, Any, Int, Int, Int, Int, Bool},
+            A, ipiv, B0, w, pack, k0, kb, nb, nt, have
+        )
+    end
+    sz = sizeof(T)
+    ld = stride(A, 2)
+    g = _lhl_line(T)
+    par = nt > 1 && n - k0 >= _lhl_thread_rows(T)
+    GC.@preserve A B0 w pack ipiv begin
+        pA = pointer(A)
+        pB = pointer(B0)
+        pw = pointer(w)
+        pip = pointer(ipiv)
+        pT = pB + nb * ldB * sz
+        pCX = pT
+        pPJ = pT + ldB * sz
+        pR1 = pT + 2ldB * sz
+        pRP = pT + 3ldB * sz
+        pOV = pT + 4ldB * sz
+        pOR = pT + 5ldB * sz
+        pPM = pT + 6ldB * sz
+        pPI = pT + 7ldB * sz
+        pSR = pT + 8ldB * sz
+        pP = pointer(pack) - k0 * sz
+        pQ = pointer(pack) + P * ldp * sz
+        pG = pQ + 4nb * nt * sz
+        if par
+            @batch for t in 1:nt
+                ia, ib = _lhl_chunk(1, n, t, nt, g)
+                ia <= ib && _lhl_b0_copy!(pA, ld, pB, ldB, k0, kb, ia, ib)
+            end
+        else
+            _lhl_b0_copy!(pA, ld, pB, ldB, k0, kb, 1, n)
+        end
+        @inbounds for k in k0:kb
+            p = have ? _lhl_pivot_combine(pPM, pPI, k, n) : _lhl_pivot_scan(pA, ld, k, n)
+            ipiv[k] = p
+            for j in k0:(kb + 1)
+                unsafe_store!(pR1, A[k + 1, j], j - k0 + 1)
+                unsafe_store!(pRP, A[p, j], j - k0 + 1)
+            end
+            if p != k + 1
+                A[k + 1, k], A[p, k] = A[p, k], A[k + 1, k]
+            end
+            piv = A[k + 1, k]
+            pulled = p > kb + 1
+            if iszero(piv)
+                p != k + 1 && _lhl_step_swaps!(A, B0, ipiv, k0, kb, k, p)
+                have = false
+                continue
+            end
+            for i in (k + 2):(kb + 1)
+                A[i, k] /= piv
+            end
+            nov = 0
+            if pulled
+                nov = _lhl_pulled_tables!(pA, ld, pRP, pOV, pOR, pCX, ipiv, k0, k, p)
+            end
+            for j in (k + 1):(kb + 1)
+                unsafe_store!(pPJ, unsafe_load(pRP, j - k0 + 1), j - k)
+            end
+            if pulled
+                unsafe_store!(pPJ, unsafe_load(pOV, k - k0 + 1), 1)
+            elseif p != k + 1
+                unsafe_store!(pPJ, unsafe_load(pRP, p - k0 + 1), 1)
+                unsafe_store!(pPJ, unsafe_load(pRP, k - k0 + 2), p - k)
+            end
+            trailing = kb + 2 <= n
+            Pw = 0
+            nsp = _lhl_special_rows!(pSR, ipiv, k0, k)
+            if trailing
+                pSub = pulled ? pB + (k - k0) * ldB * sz : Ptr{T}(0)
+                Pw = _lhl_gemv_partials!(
+                    w, A, k, k0 + 1, n, kb + 2, n, pack, ldp, nt, piv, pulled ? p : 0, pSub, pSR, nsp, pG, 2nb
+                )
+            end
+            if par && (Pw > 0 || !trailing)
+                @batch for t in 1:nt
+                    ia, ib = _lhl_chunk(k0 + 1, n, t, nt, g)
+                    ia <= ib && _lhl_step_rows!(
+                        pA, ld, pB, ldB, pw, pP, ldp, Pw, pQ + (t - 1) * 4nb * sz, pG, 2nb, pT, pip,
+                        k0, kb, k, p, nov, trailing, ia, ib
+                    )
+                    ja, jb = _lhl_chunk(1, k0, t, nt, g)
+                    ja <= jb && p != k + 1 && _lhl_exchange_rows!(pA, ld, pB, ldB, k0, kb, k, p, ja, jb)
+                end
+            else
+                _lhl_step_rows!(pA, ld, pB, ldB, pw, pP, ldp, Pw, pQ, pG, 2nb, pT, pip, k0, kb, k, p, nov, trailing, k0 + 1, n)
+                p != k + 1 && _lhl_exchange_rows!(pA, ld, pB, ldB, k0, kb, k, p, 1, k0)
+            end
+            have = true
+        end
+    end
+    return have
+end
+
+@inline function _lhl_b0_copy!(pA::Ptr{T}, ld::Int, pB::Ptr{T}, ldB::Int, k0::Int, kb::Int, ia::Int, ib::Int) where {T}
+    sz = sizeof(T)
+    for j in (k0 + 1):(kb + 1)
+        pa = pA + (j - 1) * ld * sz
+        pb = pB + (j - k0 - 1) * ldB * sz
+        @simd ivdep for i in ia:ib
+            unsafe_store!(pb, unsafe_load(pa, i), i)
+        end
+    end
+    return nothing
+end
+
+# Serial pivot search over column k: the first row of the largest |A[i, k]|, i ≥ k+1.
+@inline function _lhl_pivot_scan(pA::Ptr{T}, ld::Int, k::Int, n::Int) where {T}
+    pc = pA + (k - 1) * ld * sizeof(T)
+    p = k + 1
+    amax = abs(unsafe_load(pc, k + 1))
+    for i in (k + 2):n
+        a = abs(unsafe_load(pc, i))
+        if a > amax
+            amax = a
+            p = i
+        end
+    end
+    return p
+end
+
+# The same over the blocks of eight rows (block b = rows 8b-7:8b) a step's row chunks
+# scanned ahead: block b holds its first-largest |A[i, k]| and row, rows < k+1 excluded,
+# empty blocks -1.
+@inline function _lhl_pivot_combine(pPM::Ptr{T}, pPI::Ptr{T}, k::Int, n::Int) where {T}
+    b0 = k ÷ 8 + 1
+    b1 = (n - 1) ÷ 8 + 1
+    amax = unsafe_load(pPM, b0)
+    p = Int(unsafe_load(pPI, b0))
+    for b in (b0 + 1):b1
+        a = unsafe_load(pPM, b)
+        if a > amax
+            amax = a
+            p = Int(unsafe_load(pPI, b))
+        end
+    end
+    return p
+end
+
+# Row chunk ia:ib of column c = k+1 (rows ≥ k+2, the first as the initial candidate)
+# into the pivot blocks.
+@inline function _lhl_pivot_blocks!(pA::Ptr{T}, ld::Int, pPM::Ptr{T}, pPI::Ptr{T}, k::Int, ia::Int, ib::Int) where {T}
+    pc = pA + k * ld * sizeof(T)
+    lo = max(ia, k + 2)
+    b = (lo - 1) ÷ 8 + 1
+    i = lo
+    while i <= ib
+        ie = min(8b, ib)
+        amax = -one(T)
+        idx = 0
+        if i == k + 2
+            amax = abs(unsafe_load(pc, i))
+            idx = i
+            i += 1
+        end
+        while i <= ie
+            a = abs(unsafe_load(pc, i))
+            if a > amax
+                amax = a
+                idx = i
+            end
+            i += 1
+        end
+        unsafe_store!(pPM, amax, b)
+        unsafe_store!(pPI, T(idx), b)
+        b += 1
+    end
+    return nothing
+end
+
+# The pulled column p's values at the rows the panel's interchanges touch, after those
+# interchanges and the left transforms of steps k0:k-1 on rows ≤ k+1 (rows k+1 of the
+# multiplier columns come from the pre-swap row p); writes the value/row table and the
+# catch-up x's, returns the table length.
+function _lhl_pulled_tables!(
+        pA::Ptr{T}, ld::Int, pRP::Ptr{T}, pOV::Ptr{T}, pOR::Ptr{T}, pCX::Ptr{T},
+        ipiv::Vector{Int}, k0::Int, k::Int, p::Int
+    ) where {T}
+    sz = sizeof(T)
+    lds = ld * sz
+    pc = pA + (p - 1) * lds
+    m = k - k0 + 1
+    @inbounds for kk in k0:k
+        unsafe_store!(pOV, unsafe_load(pc, kk + 1), kk - k0 + 1)
+        unsafe_store!(pOR, T(kk + 1), kk - k0 + 1)
+    end
+    nov = m
+    @inbounds for kk in k0:k
+        q = ipiv[kk]
+        q == kk + 1 && continue
+        s = 0
+        for r in 1:nov
+            if Int(unsafe_load(pOR, r)) == q
+                s = r
+                break
+            end
+        end
+        if s == 0
+            nov += 1
+            s = nov
+            unsafe_store!(pOV, unsafe_load(pc, q), s)
+            unsafe_store!(pOR, T(q), s)
+        end
+        a = unsafe_load(pOV, kk - k0 + 1)
+        unsafe_store!(pOV, unsafe_load(pOV, s), kk - k0 + 1)
+        unsafe_store!(pOV, a, s)
+    end
+    for kk in k0:(k - 1)
+        x = unsafe_load(pOV, kk - k0 + 1)
+        unsafe_store!(pCX, x, kk - k0 + 1)
+        iszero(x) && continue
+        pkk = pA + (kk - 1) * lds
+        for i in (kk + 2):(k + 1)
+            aik = i == k + 1 ? unsafe_load(pRP, kk - k0 + 1) : unsafe_load(pkk, i)
+            unsafe_store!(pOV, unsafe_load(pOV, i - k0) - aik * x, i - k0)
+        end
+    end
+    return nov
+end
+
+# Rows ia:ib (⊂ 1:k0) of the interchange's column part.
+@inline function _lhl_exchange_rows!(
+        pA::Ptr{T}, ld::Int, pB::Ptr{T}, ldB::Int, k0::Int, kb::Int, k::Int, p::Int, ia::Int, ib::Int
+    ) where {T}
+    sz = sizeof(T)
+    pk1 = pA + k * ld * sz
+    pcp = pA + (p - 1) * ld * sz
+    pb1 = pB + (k - k0) * ldB * sz
+    if p <= kb + 1
+        pbp = pB + (p - k0 - 1) * ldB * sz
+        @simd ivdep for i in ia:ib
+            a = unsafe_load(pk1, i)
+            unsafe_store!(pk1, unsafe_load(pcp, i), i)
+            unsafe_store!(pcp, a, i)
+            b = unsafe_load(pb1, i)
+            unsafe_store!(pb1, unsafe_load(pbp, i), i)
+            unsafe_store!(pbp, b, i)
+        end
+    else
+        @simd ivdep for i in ia:ib
+            t = unsafe_load(pcp, i)
+            unsafe_store!(pcp, unsafe_load(pb1, i), i)
+            unsafe_store!(pb1, t, i)
+            unsafe_store!(pk1, t, i)
+        end
+    end
+    return nothing
+end
+
+# Batch B's row kernel, rows ia:ib ⊂ k0+1:n; see `_lhl_panel_steps!`.  pQ is this chunk's
+# private scratch (4nb values), pT the table base (B0[:, nb+1]).  Row k+1 of the
+# multiplier columns is read from the pre-swap row p table: its owner may be swapping it.
+function _lhl_step_rows!(
+        pA::Ptr{T}, ld::Int, pB::Ptr{T}, ldB::Int, pw::Ptr{T}, pP::Ptr{T}, ldp::Int, P::Int,
+        pQ::Ptr{T}, pG::Ptr{T}, ldg::Int, pT::Ptr{T}, pip::Ptr{Int}, k0::Int, kb::Int, k::Int,
+        p::Int, nov::Int, trailing::Bool, ia::Int, ib::Int
+    ) where {T}
+    sz = sizeof(T)
+    lds = ld * sz
+    ldBs = ldB * sz
+    pCX = pT
+    pPJ = pT + ldBs
+    pR1 = pT + 2ldBs
+    pRP = pT + 3ldBs
+    pOV = pT + 4ldBs
+    pOR = pT + 5ldBs
+    pPM = pT + 6ldBs
+    pPI = pT + 7ldBs
+    pk = pA + (k - 1) * lds
+    pk1 = pk + lds
+    if p != k + 1
+        for j in k0:(kb + 1)
+            j == k && continue
+            pc = pA + (j - 1) * lds
+            ia <= k + 1 <= ib && unsafe_store!(pc, unsafe_load(pRP, j - k0 + 1), k + 1)
+            ia <= p <= ib && unsafe_store!(pc, unsafe_load(pR1, j - k0 + 1), p)
+        end
+        _lhl_exchange_rows!(pA, ld, pB, ldB, k0, kb, k, p, ia, ib)
+    end
+    il = max(ia, k + 2)
+    if p > kb + 1
+        for r in 1:nov
+            i = Int(unsafe_load(pOR, r))
+            ia <= i <= ib && unsafe_store!(pk1, unsafe_load(pOV, r), i)
+        end
+        for kk in k0:(k - 1)
+            x = unsafe_load(pCX, kk - k0 + 1)
+            iszero(x) && continue
+            pkk = pA + (kk - 1) * lds
+            @simd ivdep for i in il:ib
+                unsafe_store!(pk1, unsafe_load(pk1, i) - unsafe_load(pkk, i) * x, i)
+            end
+        end
+    end
+    for j in (k + 1):(kb + 1)
+        pj = unsafe_load(pPJ, j - k)
+        iszero(pj) && continue
+        pc = pA + (j - 1) * lds
+        @simd ivdep for i in il:ib
+            unsafe_store!(pc, unsafe_load(pc, i) - unsafe_load(pk, i) * pj, i)
+        end
+    end
+    for j in (k + 2):(kb + 1)
+        vj = unsafe_load(pk, j)
+        iszero(vj) && continue
+        pc = pA + (j - 1) * lds
+        @simd ivdep for i in ia:ib
+            unsafe_store!(pk1, unsafe_load(pk1, i) + vj * unsafe_load(pc, i), i)
+        end
+    end
+    if trailing
+        P > 0 && _lhl_sum_partials!(pw, pP, ldp, P, ia, ib)
+        m = k - k0 + 1
+        pLW = pQ                        # w at rows k0+1:k+1
+        pLQ = pQ + m * sz               # w at the swap partners outside k0+1:k+1
+        pLR = pLQ + m * sz              # their rows
+        pXS = pLR + m * sz              # the correction's x's
+        for i in (k0 + 1):(k + 1)
+            unsafe_store!(pLW, _lhl_special_sum(pw, pG, ldg, P, i - k0, i), i - k0)
+        end
+        nq = 0
+        for kk in k0:k
+            q = unsafe_load(pip, kk)
+            q == kk + 1 && continue
+            if q <= k + 1
+                a = unsafe_load(pLW, kk - k0 + 1)
+                unsafe_store!(pLW, unsafe_load(pLW, q - k0), kk - k0 + 1)
+                unsafe_store!(pLW, a, q - k0)
+            else
+                s = 0
+                for r in 1:nq
+                    if Int(unsafe_load(pLR, r)) == q
+                        s = r
+                        break
                     end
                 end
-                @simd for i in (k0 + 1):n
-                    A[i, k + 1] += w[i]
+                if s == 0
+                    nq += 1
+                    s = nq
+                    unsafe_store!(pLQ, _lhl_special_sum(pw, pG, ldg, P, m + s, q), s)
+                    unsafe_store!(pLR, T(q), s)
                 end
+                a = unsafe_load(pLW, kk - k0 + 1)
+                unsafe_store!(pLW, unsafe_load(pLQ, s), kk - k0 + 1)
+                unsafe_store!(pLQ, a, s)
             end
         end
-        if kb + 2 <= n
-            for c in (kb + 2):n, k in k0:kb
-                p = ipiv[k]
-                p != k + 1 && ((A[k + 1, c], A[p, c]) = (A[p, c], A[k + 1, c]))
+        for kk in k0:k
+            x = unsafe_load(pLW, kk - k0 + 1)
+            unsafe_store!(pXS, x, kk - k0 + 1)
+            iszero(x) && continue
+            pkk = pA + (kk - 1) * lds
+            for i in (kk + 2):k
+                unsafe_store!(pLW, unsafe_load(pLW, i - k0) - unsafe_load(pkk, i) * x, i - k0)
             end
-            _lhl_trsm_block!(A, k0, kb, pack)
-            _lhl_gemm!(A, kb + 2, n, k0, kb, k0 + 1, kb + 2, kb + 2, n, -one(T), pack)
-        end
-        for k in k0:kb, j in (k + 2):(kb + 1)
-            vj = A[j, k]
-            iszero(vj) && continue
-            @simd for i in 1:k0
-                A[i, k + 1] += vj * A[i, j]
+            if kk + 2 <= k + 1
+                unsafe_store!(pLW, unsafe_load(pLW, k + 1 - k0) - unsafe_load(pRP, kk - k0 + 1) * x, k + 1 - k0)
             end
         end
-        _lhl_top_gemm!(A, k0, kb, nb, pack)
+        for i in max(ia, k0 + 1):min(ib, k + 1)
+            v = unsafe_load(pLW, i - k0)
+            unsafe_store!(pw, v, i)
+            unsafe_store!(pk1, unsafe_load(pk1, i) + v, i)
+        end
+        for r in 1:nq
+            i = Int(unsafe_load(pLR, r))
+            ia <= i <= ib && unsafe_store!(pw, unsafe_load(pLQ, r), i)
+        end
+        for kk in k0:k
+            x = unsafe_load(pXS, kk - k0 + 1)
+            iszero(x) && continue
+            pkk = pA + (kk - 1) * lds
+            @simd ivdep for i in il:ib
+                unsafe_store!(pw, unsafe_load(pw, i) - unsafe_load(pkk, i) * x, i)
+            end
+        end
+        @simd ivdep for i in il:ib
+            unsafe_store!(pk1, unsafe_load(pk1, i) + unsafe_load(pw, i), i)
+        end
     end
+    _lhl_pivot_blocks!(pA, ld, pPM, pPI, k, ia, ib)
+    return nothing
+end
+
+# Rows k0+1:k+1, then the interchange partners of steps k0:k outside them, first
+# occurrence order; returns the count.
+@inline function _lhl_special_rows!(pSR::Ptr{T}, ipiv::Vector{Int}, k0::Int, k::Int) where {T}
+    m = k - k0 + 1
+    for r in 1:m
+        unsafe_store!(pSR, T(k0 + r), r)
+    end
+    nsp = m
+    @inbounds for kk in k0:k
+        q = ipiv[kk]
+        q <= k + 1 && continue
+        found = false
+        for r in (m + 1):nsp
+            if Int(unsafe_load(pSR, r)) == q
+                found = true
+                break
+            end
+        end
+        if !found
+            nsp += 1
+            unsafe_store!(pSR, T(q), nsp)
+        end
+    end
+    return nsp
+end
+
+# w at special row i (slot r of the gather table): the P groups' values summed in order,
+# or w itself when the serial path already holds the sum (P = 0).
+@inline function _lhl_special_sum(pw::Ptr{T}, pG::Ptr{T}, ldg::Int, P::Int, r::Int, i::Int) where {T}
+    P == 0 && return unsafe_load(pw, i)
+    s = unsafe_load(pG, r)
+    for p in 2:P
+        s += unsafe_load(pG + (p - 1) * ldg * sizeof(T), r)
+    end
+    return s
+end
+
+# The row interchanges of steps k0:kb applied to columns c0:c1.
+function _lhl_swap_rows!(A::AbstractMatrix, ipiv, k0::Int, kb::Int, c0::Int, c1::Int, nt::Int)
+    @inbounds for c in c0:c1, k in k0:kb
+        p = ipiv[k]
+        p != k + 1 && ((A[k + 1, c], A[p, c]) = (A[p, c], A[k + 1, c]))
+    end
+    return nothing
+end
+
+function _lhl_swap_rows!(
+        A::StridedMatrix{T}, ipiv::Vector{Int}, k0::Int, kb::Int, c0::Int, c1::Int, nt::Int
+    ) where {T <: Union{Float32, Float64}}
+    if nt == 1 || stride(A, 1) != 1 || c1 - c0 + 1 <= _LHL_GEMV_GROUP
+        return invoke(_lhl_swap_rows!, Tuple{AbstractMatrix, Any, Int, Int, Int, Int, Int}, A, ipiv, k0, kb, c0, c1, nt)
+    end
+    GC.@preserve A ipiv begin
+        pA = pointer(A)
+        pip = pointer(ipiv)
+        ld = stride(A, 2)
+        P = cld(c1 - c0 + 1, _LHL_GEMV_GROUP)
+        @batch for p in 1:P
+            ca, cb = _lhl_group(c0, c1, p)
+            _lhl_swap_cols_ptr!(pA, ld, pip, k0, kb, ca, cb)
+        end
+    end
+    return nothing
+end
+
+@inline function _lhl_swap_cols_ptr!(pA::Ptr{T}, ld::Int, pip::Ptr{Int}, k0::Int, kb::Int, ca::Int, cb::Int) where {T}
+    for c in ca:cb
+        pc = pA + (c - 1) * ld * sizeof(T)
+        for k in k0:kb
+            p = unsafe_load(pip, k)
+            if p != k + 1
+                x = unsafe_load(pc, k + 1)
+                unsafe_store!(pc, unsafe_load(pc, p), k + 1)
+                unsafe_store!(pc, x, p)
+            end
+        end
+    end
+    return nothing
+end
+
+# The interchanges deferred on the multipliers: column c of panel k0:kb receives those of
+# every later step.
+function _lhl_swap_deferred!(A::AbstractMatrix, ipiv, nb::Int, nt::Int)
+    n = size(A, 2)
     @inbounds for k0 in 1:nb:(n - 2)
         kb = min(k0 + nb - 1, n - 2)
         for c in k0:kb, k in (kb + 1):(n - 2)
@@ -799,11 +1360,36 @@ function _lhl_reduce_blocked!(
             p != k + 1 && ((A[k + 1, c], A[p, c]) = (A[p, c], A[k + 1, c]))
         end
     end
-    return A
+    return nothing
 end
 
-# w[r0:r1] += Σ_{j=c0}^{c1} A[j, k] * A[r0:r1, j]
+function _lhl_swap_deferred!(
+        A::StridedMatrix{T}, ipiv::Vector{Int}, nb::Int, nt::Int
+    ) where {T <: Union{Float32, Float64}}
+    n = size(A, 2)
+    if nt == 1 || stride(A, 1) != 1 || n - 2 < nb * nt
+        return invoke(_lhl_swap_deferred!, Tuple{AbstractMatrix, Any, Int, Int}, A, ipiv, nb, nt)
+    end
+    GC.@preserve A ipiv begin
+        pA = pointer(A)
+        pip = pointer(ipiv)
+        ld = stride(A, 2)
+        @batch for t in 1:nt
+            ca, cb = _lhl_chunk(1, n - 2, t, nt, nb)
+            for c in ca:cb
+                kbc = min(((c - 1) ÷ nb + 1) * nb, n - 2)
+                _lhl_swap_cols_ptr!(pA, ld, pip, kbc + 1, n - 2, c, c)
+            end
+        end
+    end
+    return nothing
+end
+
+# w[r0:r1] = Σ_{j=c0}^{c1} A[j, k] * A[r0:r1, j]
 function _lhl_gemv_cols!(w, A::AbstractMatrix{T}, k::Int, r0::Int, r1::Int, c0::Int, c1::Int) where {T}
+    @inbounds for i in r0:r1
+        w[i] = zero(T)
+    end
     j = c0
     @inbounds while j + 3 <= c1
         l1 = A[j, k]; l2 = A[j + 1, k]; l3 = A[j + 2, k]; l4 = A[j + 3, k]
@@ -824,52 +1410,234 @@ function _lhl_gemv_cols!(w, A::AbstractMatrix{T}, k::Int, r0::Int, r1::Int, c0::
     return w
 end
 
-# The deferred right updates of rows 1:k0 of the panel columns:
-# A[1:k0, k0+1:kb+1] += A[1:k0, kb+2:n] * A[kb+2:n, k0:kb], one nb-wide K chunk at a time.
-function _lhl_top_gemm!(A::AbstractMatrix{T}, k0::Int, kb::Int, nb::Int, pack) where {T}
+# The pointer path cuts the columns into groups of `_LHL_GEMV_GROUP`, forms each group's
+# product separately and adds the group sums in order, w = ((g₁ + g₂) + g₃) + ….  Threads
+# take groups and leave the P partials (rows r0:r1, stride ldp, in `pack`) for the caller's
+# row chunks to sum, returning P; the serial path sums group by group into `w` through
+# one scratch vector and returns 0.  A group's column set depends on the sizes only, so
+# both give the same bits.  Each group first scales its rows of the multiplier column by 1/piv;
+# column psub (a column pulled into the panel this step) is read from pSub instead.  The
+# threads also copy their partial at the nsp rows listed in pSR into their row of the
+# gather table pG (stride ldg), for the row chunks' redundant triangle.
+const _LHL_GEMV_GROUP = 64
+@inline _lhl_group(c0::Int, c1::Int, p::Int) =
+    (c0 + (p - 1) * _LHL_GEMV_GROUP, min(c0 + p * _LHL_GEMV_GROUP - 1, c1))
+function _lhl_gemv_partials!(
+        w::Vector{T}, A::StridedMatrix{T}, k::Int, r0::Int, r1::Int, c0::Int, c1::Int,
+        pack::Array{T}, ldp::Int, nt::Int, piv::T, psub::Int, pSub::Ptr{T}, pSR::Ptr{T},
+        nsp::Int, pG::Ptr{T}, ldg::Int
+    ) where {T <: Union{Float32, Float64}}
+    P = cld(c1 - c0 + 1, _LHL_GEMV_GROUP)
+    sz = sizeof(T)
+    GC.@preserve w A pack begin
+        pw = pointer(w)
+        pA = pointer(A)
+        ld = stride(A, 2)
+        pP = pointer(pack) - (r0 - 1) * sz
+        if nt > 1 && P > 1
+            @batch for p in 1:P
+                ca, cb = _lhl_group(c0, c1, p)
+                pp = pP + (p - 1) * ldp * sz
+                _lhl_gemv_group!(pp, pA, ld, k, r0, r1, ca, cb, piv, psub, pSub)
+                pg = pG + (p - 1) * ldg * sz
+                for r in 1:nsp
+                    unsafe_store!(pg, unsafe_load(pp, Int(unsafe_load(pSR, r))), r)
+                end
+            end
+            return P
+        end
+        ca, cb = _lhl_group(c0, c1, 1)
+        _lhl_gemv_group!(pw, pA, ld, k, r0, r1, ca, cb, piv, psub, pSub)
+        for p in 2:P
+            ca, cb = _lhl_group(c0, c1, p)
+            _lhl_gemv_group!(pP, pA, ld, k, r0, r1, ca, cb, piv, psub, pSub)
+            @simd ivdep for i in r0:r1
+                unsafe_store!(pw, unsafe_load(pw, i) + unsafe_load(pP, i), i)
+            end
+        end
+    end
+    return 0
+end
+
+@inline _lhl_colp(pA::Ptr{T}, lds::Int, j::Int, psub::Int, pSub::Ptr{T}) where {T} =
+    j == psub ? pSub : pA + (j - 1) * lds
+
+# A[c0:c1, k] /= piv, then w[r0:r1] = Σ_{j=c0}^{c1} A[j, k] * A[r0:r1, j], c0 ≤ c1, four
+# columns per pass; the first pass assigns.
+@inline function _lhl_gemv_group!(
+        pw::Ptr{T}, pA::Ptr{T}, ld::Int, k::Int, r0::Int, r1::Int, c0::Int, c1::Int,
+        piv::T, psub::Int, pSub::Ptr{T}
+    ) where {T}
+    sz = sizeof(T)
+    lds = ld * sz
+    pl = pA + (k - 1) * lds
+    for j in c0:c1
+        unsafe_store!(pl, unsafe_load(pl, j) / piv, j)
+    end
+    j = c0
+    if j + 3 <= c1
+        l1 = unsafe_load(pl, j); l2 = unsafe_load(pl, j + 1)
+        l3 = unsafe_load(pl, j + 2); l4 = unsafe_load(pl, j + 3)
+        p1 = _lhl_colp(pA, lds, j, psub, pSub); p2 = _lhl_colp(pA, lds, j + 1, psub, pSub)
+        p3 = _lhl_colp(pA, lds, j + 2, psub, pSub); p4 = _lhl_colp(pA, lds, j + 3, psub, pSub)
+        @simd ivdep for i in r0:r1
+            unsafe_store!(
+                pw, (l1 * unsafe_load(p1, i) + l2 * unsafe_load(p2, i)) +
+                    (l3 * unsafe_load(p3, i) + l4 * unsafe_load(p4, i)), i
+            )
+        end
+        j += 4
+    else
+        lj = unsafe_load(pl, j)
+        p1 = _lhl_colp(pA, lds, j, psub, pSub)
+        @simd ivdep for i in r0:r1
+            unsafe_store!(pw, lj * unsafe_load(p1, i), i)
+        end
+        j += 1
+    end
+    while j + 3 <= c1
+        l1 = unsafe_load(pl, j); l2 = unsafe_load(pl, j + 1)
+        l3 = unsafe_load(pl, j + 2); l4 = unsafe_load(pl, j + 3)
+        p1 = _lhl_colp(pA, lds, j, psub, pSub); p2 = _lhl_colp(pA, lds, j + 1, psub, pSub)
+        p3 = _lhl_colp(pA, lds, j + 2, psub, pSub); p4 = _lhl_colp(pA, lds, j + 3, psub, pSub)
+        @simd ivdep for i in r0:r1
+            unsafe_store!(
+                pw, unsafe_load(pw, i) + (
+                    (l1 * unsafe_load(p1, i) + l2 * unsafe_load(p2, i)) +
+                        (l3 * unsafe_load(p3, i) + l4 * unsafe_load(p4, i))
+                ), i
+            )
+        end
+        j += 4
+    end
+    while j <= c1
+        lj = unsafe_load(pl, j)
+        if !iszero(lj)
+            p1 = _lhl_colp(pA, lds, j, psub, pSub)
+            @simd ivdep for i in r0:r1
+                unsafe_store!(pw, unsafe_load(pw, i) + lj * unsafe_load(p1, i), i)
+            end
+        end
+        j += 1
+    end
+    return nothing
+end
+
+# w[ia:ib] = ((g₁ + g₂) + g₃) + … over the P partials at stride ldp, one vector of rows
+# at a time so that the P loads of a row are in flight together (the partials sit in other
+# cores' caches).
+@inline function _lhl_sum_partials!(pw::Ptr{T}, pP::Ptr{T}, ldp::Int, P::Int, ia::Int, ib::Int) where {T}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    lps = ldp * sz
+    i = ia
+    while i + W - 1 <= ib
+        q = pP + (i - 1) * sz
+        acc = _lhl_vload(V, q)
+        for p in 2:P
+            acc = _lhl_vadd(acc, _lhl_vload(V, q + (p - 1) * lps))
+        end
+        _lhl_vstore!(pw + (i - 1) * sz, acc)
+        i += W
+    end
+    while i <= ib
+        q = pP + (i - 1) * sz
+        s = unsafe_load(q)
+        for p in 2:P
+            s += unsafe_load(q + (p - 1) * lps)
+        end
+        unsafe_store!(pw, s, i)
+        i += 1
+    end
+    return nothing
+end
+
+# The deferred right updates of rows 1:k0 of the panel columns: from the panel columns
+# themselves, then A[1:k0, k0+1:kb+1] += A[1:k0, kb+2:n] * A[kb+2:n, k0:kb], one nb-wide K
+# chunk at a time.
+function _lhl_top_gemm!(A::AbstractMatrix{T}, k0::Int, kb::Int, nb::Int, pack, nt::Int) where {T}
     n = size(A, 2)
+    _lhl_top_fix!(A, k0, kb, 1, k0)
     for kk in (kb + 2):nb:n
         ke = min(kk + nb - 1, n)
-        _lhl_gemm!(A, 1, k0, kk, ke, kk, k0, k0 + 1, kb + 1, one(T), pack)
+        _lhl_gemm!(A, 1, k0, kk, ke, kk, k0, k0 + 1, kb + 1, one(T), pack, 1)
+    end
+    return nothing
+end
+
+@inline function _lhl_top_fix!(A::AbstractMatrix, k0::Int, kb::Int, ia::Int, ib::Int)
+    @inbounds for k in k0:kb, j in (k + 2):(kb + 1)
+        vj = A[j, k]
+        iszero(vj) && continue
+        @simd for i in ia:ib
+            A[i, k + 1] += vj * A[i, j]
+        end
     end
     return nothing
 end
 
 # Same in K chunks of 64: with only nb output columns, packing the k0×K left operand would
 # cost as much as the product, so the tile reads it in place in row blocks small enough
-# that a block's chunk stays in L1/L2.
+# that a block's chunk stays in L1/L2.  Threads take row chunks of whole tiles, each doing
+# its rows' panel-column part first.
 function _lhl_top_gemm!(
-        A::StridedMatrix{T}, k0::Int, kb::Int, nb::Int, pack::Array{T}
+        A::StridedMatrix{T}, k0::Int, kb::Int, nb::Int, pack::Array{T}, nt::Int
     ) where {T <: Union{Float32, Float64}}
     n = size(A, 2)
-    (kb + 2 > n || k0 < 1) && return nothing
     if stride(A, 1) != 1
-        return invoke(_lhl_top_gemm!, Tuple{AbstractMatrix{T}, Int, Int, Int, Any}, A, k0, kb, nb, pack)
+        return invoke(_lhl_top_gemm!, Tuple{AbstractMatrix{T}, Int, Int, Int, Any, Int}, A, k0, kb, nb, pack, nt)
     end
+    mr = 3 * (_LHL_VEC_BYTES ÷ sizeof(T))
+    ld = stride(A, 2)
+    GC.@preserve A begin
+        pA = pointer(A)
+        if nt > 1 && k0 >= 4mr
+            @batch for t in 1:nt
+                ia, ib = _lhl_chunk(1, k0, t, nt, mr)
+                ia <= ib && _lhl_top_gemm_rows!(pA, ld, k0, kb, n, ia, ib)
+            end
+        else
+            _lhl_top_gemm_rows!(pA, ld, k0, kb, n, 1, k0)
+        end
+    end
+    return nothing
+end
+
+@inline function _lhl_top_gemm_rows!(pA::Ptr{T}, ld::Int, k0::Int, kb::Int, n::Int, ia::Int, ie0::Int) where {T}
     V = _lhl_vectype(T)
     W = _LHL_VEC_BYTES ÷ sizeof(T)
     mr = 3W
     rowblock = 4mr
-    ld = stride(A, 2)
     sz = sizeof(T)
-    GC.@preserve A begin
-        pA = pointer(A)
-        j = kb + 2
-        while j <= n
-            K = min(64, n - j + 1)
-            pP = pA + (j - 1) * ld * sz
-            pB = pA + (j - 1 - ld) * sz
-            ib = 1
-            while ib <= k0
-                ie = min(ib + rowblock - 1, k0)
-                rfull = ib + ((ie - ib + 1) ÷ mr) * mr - 1
-                ct = _lhl_micro_tile!(V, pA, ld, pP, ld, pB, ld, K, 1, ib, rfull, k0 + 1, kb + 1)
-                _lhl_micro_edge!(V, pA, ld, pP, ld, pB, ld, K, 1, rfull + 1, ie, k0 + 1, kb + 1)
-                _lhl_micro_edge!(V, pA, ld, pP, ld, pB, ld, K, 1, ib, rfull, ct, kb + 1)
-                ib = ie + 1
+    lds = ld * sz
+    for k in k0:kb
+        pk = pA + (k - 1) * lds
+        for j in (k + 2):(kb + 1)
+            vj = unsafe_load(pk, j)
+            iszero(vj) && continue
+            pc = pA + (j - 1) * lds
+            @simd ivdep for i in ia:ie0
+                unsafe_store!(pk + lds, unsafe_load(pk + lds, i) + vj * unsafe_load(pc, i), i)
             end
-            j += K
         end
+    end
+    kb + 2 <= n || return nothing
+    j = kb + 2
+    while j <= n
+        K = min(64, n - j + 1)
+        pP = pA + (j - 1) * ld * sz
+        pB = pA + (j - 1 - ld) * sz
+        ib = ia
+        while ib <= ie0
+            ie = min(ib + rowblock - 1, ie0)
+            rfull = ib + ((ie - ib + 1) ÷ mr) * mr - 1
+            ct = _lhl_micro_tile!(V, pA, ld, pP, ld, pB, ld, K, 1, ib, rfull, k0 + 1, kb + 1)
+            _lhl_micro_edge!(V, pA, ld, pP, ld, pB, ld, K, 1, rfull + 1, ie, k0 + 1, kb + 1)
+            _lhl_micro_edge!(V, pA, ld, pP, ld, pB, ld, K, 1, ib, rfull, ct, kb + 1)
+            ib = ie + 1
+        end
+        j += K
     end
     return nothing
 end
@@ -878,7 +1646,7 @@ end
 # The three blocks must not overlap.
 function _lhl_gemm!(
         A::AbstractMatrix{T}, i0::Int, i1::Int, j0::Int, j1::Int, r0::Int,
-        cB::Int, c0::Int, c1::Int, sgn::T, pack
+        cB::Int, c0::Int, c1::Int, sgn::T, pack, nt::Int
     ) where {T}
     (i1 < i0 || j1 < j0 || c1 < c0) && return nothing
     @inbounds for c in c0:c1, (jj, j) in enumerate(j0:j1)
@@ -893,15 +1661,15 @@ end
 
 function _lhl_gemm!(
         A::StridedMatrix{T}, i0::Int, i1::Int, j0::Int, j1::Int, r0::Int,
-        cB::Int, c0::Int, c1::Int, sgn::T, pack::Array{T}
+        cB::Int, c0::Int, c1::Int, sgn::T, pack::Array{T}, nt::Int
     ) where {T <: Union{Float32, Float64}}
     (i1 < i0 || j1 < j0 || c1 < c0) && return nothing
     if stride(A, 1) == 1
-        _lhl_gemm_micro!(A, i0, i1, j0, j1, r0, cB, c0, c1, sgn, pack)
+        _lhl_gemm_micro!(A, i0, i1, j0, j1, r0, cB, c0, c1, sgn, pack, nt)
     else
         invoke(
-            _lhl_gemm!, Tuple{AbstractMatrix{T}, Int, Int, Int, Int, Int, Int, Int, Int, T, Any},
-            A, i0, i1, j0, j1, r0, cB, c0, c1, sgn, pack
+            _lhl_gemm!, Tuple{AbstractMatrix{T}, Int, Int, Int, Int, Int, Int, Int, Int, T, Any, Int},
+            A, i0, i1, j0, j1, r0, cB, c0, c1, sgn, pack, nt
         )
     end
     return nothing
@@ -1059,9 +1827,10 @@ end
     return c
 end
 
+# Threads take the GEMV's column groups (whole 4-column tiles); every thread reads all of P.
 function _lhl_gemm_micro!(
         A::StridedMatrix{T}, i0::Int, i1::Int, j0::Int, j1::Int, r0::Int,
-        cB::Int, c0::Int, c1::Int, sgn::T, pack::Array{T}
+        cB::Int, c0::Int, c1::Int, sgn::T, pack::Array{T}, nt::Int
     ) where {T <: Union{Float32, Float64}}
     K = j1 - j0 + 1
     rows = i1 - i0 + 1
@@ -1073,25 +1842,41 @@ function _lhl_gemm_micro!(
             pack[off + i] = sgn * A[i, j]
         end
     end
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
-    mr = 3W
-    rowblock = 384
     ld = stride(A, 2)
     sz = sizeof(T)
     GC.@preserve A pack begin
         pA = pointer(A)
         pP = pointer(pack)
         pB = pA + ((cB - c0) * ld + (r0 - 1)) * sz
-        ib = i0
-        while ib <= i1
-            ie = min(ib + rowblock - 1, i1)
-            rfull = ib + ((ie - ib + 1) ÷ mr) * mr - 1
-            ct = _lhl_micro_tile!(V, pA, ld, pP, ldp, pB, ld, K, i0, ib, rfull, c0, c1)
-            _lhl_micro_edge!(V, pA, ld, pP, ldp, pB, ld, K, i0, rfull + 1, ie, c0, c1)
-            _lhl_micro_edge!(V, pA, ld, pP, ldp, pB, ld, K, i0, ib, rfull, ct, c1)
-            ib = ie + 1
+        if nt > 1 && c1 - c0 + 1 > _LHL_GEMV_GROUP
+            P = cld(c1 - c0 + 1, _LHL_GEMV_GROUP)
+            @batch for p in 1:P
+                ca, cb = _lhl_group(c0, c1, p)
+                _lhl_gemm_tiles!(pA, ld, pP, ldp, pB, K, i0, i1, ca, cb)
+            end
+        else
+            _lhl_gemm_tiles!(pA, ld, pP, ldp, pB, K, i0, i1, c0, c1)
         end
+    end
+    return nothing
+end
+
+@inline function _lhl_gemm_tiles!(
+        pA::Ptr{T}, ld::Int, pP::Ptr{T}, ldp::Int, pB::Ptr{T}, K::Int, i0::Int, i1::Int,
+        c0::Int, c1::Int
+    ) where {T}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    mr = 3W
+    rowblock = 384
+    ib = i0
+    while ib <= i1
+        ie = min(ib + rowblock - 1, i1)
+        rfull = ib + ((ie - ib + 1) ÷ mr) * mr - 1
+        ct = _lhl_micro_tile!(V, pA, ld, pP, ldp, pB, ld, K, i0, ib, rfull, c0, c1)
+        _lhl_micro_edge!(V, pA, ld, pP, ldp, pB, ld, K, i0, rfull + 1, ie, c0, c1)
+        _lhl_micro_edge!(V, pA, ld, pP, ldp, pB, ld, K, i0, ib, rfull, ct, c1)
+        ib = ie + 1
     end
     return nothing
 end
@@ -1100,7 +1885,7 @@ end
 # Rows k0+1:kb+1 of the trailing block T = A[:, kb+2:n] ← M⁻¹ · rows, M the unit lower
 # triangle of the panel's multipliers (M[i, k+1] = A[i, k] for i ≥ k+2, i.e. the panel's left
 # transforms restricted to its own rows).  Row k0+1 is unchanged.
-function _lhl_trsm_block!(A::AbstractMatrix{T}, k0::Int, kb::Int, pack) where {T}
+function _lhl_trsm_block!(A::AbstractMatrix{T}, k0::Int, kb::Int, pack, nt::Int = 1) where {T}
     n = size(A, 2)
     @inbounds for c in (kb + 2):n, k in k0:kb
         x = A[k + 1, c]
@@ -1114,15 +1899,16 @@ end
 
 # Same as a GEMM: rows k0+1:kb+1 += (M⁻¹ - I) · rows k0+1:kb+1, with the small inverse formed
 # explicitly (nb³/6) and the source rows copied out first (they are the destination).  Both
-# live in `pack`, in the microkernel's packed-P / B layouts.
+# live in `pack`, in the microkernel's packed-P / B layouts.  Threads take the GEMV's
+# column groups, each copying and solving its own columns.
 function _lhl_trsm_block!(
-        A::StridedMatrix{T}, k0::Int, kb::Int, pack::Array{T}
+        A::StridedMatrix{T}, k0::Int, kb::Int, pack::Array{T}, nt::Int = 1
     ) where {T <: Union{Float32, Float64}}
     n = size(A, 2)
     nb = kb - k0 + 1
     ncol = n - kb - 1
     if stride(A, 1) != 1 || nb < 2 || length(pack) < nb * nb + nb * ncol
-        return invoke(_lhl_trsm_block!, Tuple{AbstractMatrix{T}, Int, Int, Any}, A, k0, kb, pack)
+        return invoke(_lhl_trsm_block!, Tuple{AbstractMatrix{T}, Int, Int, Any, Int}, A, k0, kb, pack, nt)
     end
     # P = M⁻¹ - I, column-major with leading dimension nb; M[r, s] = A[k0+r, k0+s-1] for r > s.
     @inbounds for q in 1:nb
@@ -1138,34 +1924,83 @@ function _lhl_trsm_block!(
         end
     end
     off = nb * nb
-    @inbounds for c in (kb + 2):n
-        o = off + (c - kb - 2) * nb - k0
-        @simd for i in (k0 + 1):(kb + 1)
-            pack[o + i] = A[i, c]
-        end
-    end
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
     ld = stride(A, 2)
     GC.@preserve A pack begin
         pA = pointer(A)
         pP = pointer(pack)
         pB = pointer(pack) + (off - (kb + 1) * nb) * sz
-        ib = k0 + 1
-        ie = kb + 1
-        rfull = ib + (nb ÷ (3W)) * 3W - 1
-        ct = _lhl_micro_tile!(V, pA, ld, pP, nb, pB, nb, nb, ib, ib, rfull, kb + 2, n)
-        _lhl_micro_edge!(V, pA, ld, pP, nb, pB, nb, nb, ib, ib, rfull, ct, n)
-        r = rfull + 1
-        while r + W - 1 <= ie
-            ct = _lhl_micro_tile1!(V, pA, ld, pP, nb, pB, nb, nb, ib, r, kb + 2, n)
-            _lhl_micro_edge!(V, pA, ld, pP, nb, pB, nb, nb, ib, r, r + W - 1, ct, n)
-            r += W
+        if nt > 1 && ncol > _LHL_GEMV_GROUP
+            P = cld(ncol, _LHL_GEMV_GROUP)
+            @batch for p in 1:P
+                ca, cb = _lhl_group(kb + 2, n, p)
+                _lhl_trsm_cols!(pA, ld, pP, pB, nb, k0, kb, ca, cb)
+            end
+        else
+            _lhl_trsm_cols!(pA, ld, pP, pB, nb, k0, kb, kb + 2, n)
         end
-        _lhl_micro_edge!(V, pA, ld, pP, nb, pB, nb, nb, ib, r, ie, kb + 2, n)
     end
     return A
+end
+
+@inline function _lhl_trsm_cols!(
+        pA::Ptr{T}, ld::Int, pP::Ptr{T}, pB::Ptr{T}, nb::Int, k0::Int, kb::Int, ca::Int, cb::Int
+    ) where {T}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    for c in ca:cb
+        pc = pA + (c - 1) * ld * sz
+        po = pB + ((c - 1) * nb - k0) * sz
+        for i in (k0 + 1):(kb + 1)
+            unsafe_store!(po, unsafe_load(pc, i), i)
+        end
+    end
+    ib = k0 + 1
+    ie = kb + 1
+    rfull = ib + (nb ÷ (3W)) * 3W - 1
+    ct = _lhl_micro_tile!(V, pA, ld, pP, nb, pB, nb, nb, ib, ib, rfull, ca, cb)
+    _lhl_micro_edge!(V, pA, ld, pP, nb, pB, nb, nb, ib, ib, rfull, ct, cb)
+    r = rfull + 1
+    while r + W - 1 <= ie
+        ct = _lhl_micro_tile1!(V, pA, ld, pP, nb, pB, nb, nb, ib, r, ca, cb)
+        _lhl_micro_edge!(V, pA, ld, pP, nb, pB, nb, nb, ib, r, r + W - 1, ct, cb)
+        r += W
+    end
+    _lhl_micro_edge!(V, pA, ld, pP, nb, pB, nb, nb, ib, r, ie, ca, cb)
+    return nothing
+end
+
+# Ht[j, i] = A[i, j] for i ≤ j + 1: row j of Ht is column j of A, transposed a line of
+# columns at a time; threads take column chunks.
+function _lhl_ht_fill!(Ht::Matrix{T}, A::AbstractMatrix{T}, n::Int, nt::Int) where {T}
+    g = 8
+    if nt > 1 && n >= 4g * nt
+        @batch for t in 1:nt
+            ja, jb = _lhl_chunk(1, n, t, nt, g)
+            ja <= jb && _lhl_ht_fill_cols!(Ht, A, n, ja, jb)
+        end
+    else
+        _lhl_ht_fill_cols!(Ht, A, n, 1, n)
+    end
+    return Ht
+end
+
+@inline function _lhl_ht_fill_cols!(Ht, A, n::Int, ja::Int, jb::Int)
+    @inbounds for j0 in ja:8:jb
+        j1 = min(j0 + 7, jb)
+        for i in 1:min(j0 + 1, n)
+            for j in j0:j1
+                Ht[j, i] = A[i, j]
+            end
+        end
+        for i in (j0 + 2):min(j1 + 1, n)
+            for j in (i - 1):j1
+                Ht[j, i] = A[i, j]
+            end
+        end
+    end
+    return nothing
 end
 
 """
@@ -2261,25 +3096,49 @@ end
 
 
 """
-    lhl(J; balance = true, shift = eltype(J)) -> LHLWorkspace
-    lhl!(ws, J; balance = true) -> LHLWorkspace
+    lhl(J; balance = true, shift = eltype(J), thread = Val(true)) -> LHLWorkspace
+    lhl!(ws, J; balance = true, thread = Val(true)) -> LHLWorkspace
 
 Reduce `J` to upper Hessenberg form by Gaussian similarity with partial pivoting.  `J` is
 not modified.  `lhl!` reuses an existing workspace, resizing it if needed.  `shift` is the
 element type of the shifts and solves; `Complex{eltype(J)}` on a real `J` keeps the
 reduction real and makes only the shifted half complex (see [`LHLShift`](@ref)).
 
+`thread = Val(true)` lets the blocked reduction (`n ≥ 500` for `Float64`, `1024` for
+`Float32`; other element types stay serial) run on Polyester threads when
+`Threads.nthreads() > 1`; `Val(false)` (or `false`) keeps it single-threaded.  The
+threaded work is partitioned independently of the thread count, so `factors`, `Lp`,
+`Ht` and the solves are bit-identical for any number of threads.  The shifts and solves
+are serial and work per right-hand side; nothing here reads or sets the BLAS thread count.
+
 Follow with [`lhl_shift!`](@ref) to load a shift and [`lhl_ldiv!`](@ref) to solve.
 """
-function lhl(J::AbstractMatrix; balance::Bool = true, shift::Type = eltype(J))
+function lhl(J::AbstractMatrix; balance::Bool = true, shift::Type = eltype(J), thread = Val(true))
     ws = LHLWorkspace{eltype(J)}(checksquare(J); shift)
-    lhl_reduce!(ws, J, balance)
+    lhl_reduce!(ws, J, balance, thread)
     return ws
 end
 
-function lhl!(ws::LHLWorkspace, J::AbstractMatrix; balance::Bool = true)
-    lhl_reduce!(ws, J, balance)
+function lhl!(ws::LHLWorkspace, J::AbstractMatrix; balance::Bool = true, thread = Val(true))
+    lhl_reduce!(ws, J, balance, thread)
     return ws
+end
+
+# Compile the reduction, shift and solve for both float types into the package image
+# (`ccall(:jl_generating_output)`: only while precompiling); the blocked path with two
+# chunks so that the `@batch` bodies are compiled as well.
+if ccall(:jl_generating_output, Cint, ()) == 1
+    let
+        for T in (Float64, Float32)
+            J = T[1 / (i + j) + (i == j) for i in 1:64, j in 1:64]
+            ws = lhl(J)
+            lhl!(ws, J; thread = Val(false))
+            lhl_shift!(ws, one(T), -one(T) / 8)
+            lhl_ldiv!(ones(T, 64), ws)
+            _lhl_reduce_blocked!(ws.fstore, ws.ipiv, ws.Ht, ws.work, ws.pack, 16, 2)
+            _lhl_ht_fill!(ws.Ht, ws.fstore, 64, 2)
+        end
+    end
 end
 
 end # module
