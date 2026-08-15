@@ -96,16 +96,20 @@ axis; the reduction here costs `5/3 n³` against an LU's `2/3 n³`.
 | fresh LU per shift | — | `2/3 n³` | `2n²` |
 | LHL        | `5/3 n³`  | `n²`      | `3n²` |
 
-Measured against LAPACK on one thread, a new shift is 11× cheaper than a refactorization at
-`n = 50` and 45× at `n = 1600`. The solve is ~2× an LU's, so the trade pays whenever a
-factorization serves more shifts than it does solves-per-shift; see the break-even table in
-the docstrings.
+Measured against LAPACK on one thread, a new shift is 25× cheaper than a refactorization at
+`n = 50`, 50× at `n = 256` and 80–95× at `n = 1600–2000`. The solve costs about what an
+LU's triangular solves do (0.6× at `n ≤ 64`, 1.0–1.2× at `n = 256–2000`), so the trade
+pays whenever a factorization serves more than a handful of shifts.
 
-The reduction is unblocked (BLAS-2) and falls off cache: at `n = 1600` it runs ~10× an
-LAPACK LU where the flop ratio says 5×. If your reductions dominate, LAPACK's blocked
-*orthogonal* Hessenberg reduction (`LinearAlgebra.hessenberg`) is the better front end past
-`n ≈ 800` — but note its stdlib shifted solve re-factorizes the Hessenberg on *every*
-solve rather than caching one per shift.
+The reduction is unblocked below `n ≈ 250` (Float64; 500 for Float32) and blocked above:
+delayed panel updates with rank-`nb` GEMMs in a register-blocked pure-Julia microkernel, no
+BLAS. On one thread it runs at 1× a LAPACK LU for `n ≤ 64`, 3× at `n = 256`, 4× at
+`n = 1024` and 7–8× at `n = 2000`, where the trailing GEMV that dominates it is DRAM-bound.
+It is faster than LAPACK's blocked *orthogonal* Hessenberg reduction
+(`LinearAlgebra.hessenberg`, `dgehrd`) at every size measured — 3.6× at `n = 64`, 2× at
+`n = 256–1024`, 1.3–1.6× at `n = 2000` — so `hessenberg` is not a better front end at any
+size; its stdlib shifted solve also re-factorizes the Hessenberg on *every* solve rather
+than caching one per shift.
 
 ## Stability
 
