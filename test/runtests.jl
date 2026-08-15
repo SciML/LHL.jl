@@ -35,18 +35,25 @@ end
 end
 
 @testset "explicit-vector solve kernels agree with the generic ones" begin
-    for T in (Float64, Float32), n in (3, 7, 33, 130, 331, 500)
+    # 725 (Float64) and 1030 (both) put the packed multipliers above the 2 MiB tiling limit
+    for T in (Float64, Float32), n in (3, 7, 33, 130, 331, 500, 725, 1030)
         J = randn(MersenneTwister(n), T, n, n)
         b = randn(MersenneTwister(n + 7), T, n)
         ws = lhl(J)
         lhl_shift!(ws, 1, -0.05)
         W = I - T(0.05) * J
         x = lhl_ldiv!(copy(b), ws)                    # Vector{T}: explicit kernels
-        y = lhl_ldiv!(view(copy(b), :), ws)          # view: generic path
-        for z in (x, y)
-            @test z ≈ W \ b rtol = (T == Float32 ? 1.0e-3 : 1.0e-9)
-            @test bwd(W, z, b) < 50 * eps(T)
+        y = lhl_ldiv!(view(copy(b), :), ws)          # view, same eltype: buffered generic path
+        z = lhl_ldiv!(complex.(b), ws)               # other eltype: in-place generic path
+        for v in (x, y, z)
+            # past n ≈ 500 the Float32 forward error (κ(W)·eps) exceeds 1e-3 for any solver
+            # and the backward error carries κ(Z) past 50 eps; the three paths must still
+            # agree with each other there
+            (T == Float64 || n <= 500) && @test v ≈ W \ b rtol = (T == Float32 ? 1.0e-3 : 1.0e-9)
+            @test bwd(W, v, b) < (n <= 500 ? 50 * eps(T) : 2 * bwd(W, x, b) + eps(T))
         end
+        @test_throws DimensionMismatch lhl_ldiv!(zeros(T, n + 1), ws)
+        @test_throws DimensionMismatch applyZ!(zeros(T, n - 1), ws)
     end
 end
 

@@ -60,12 +60,16 @@ Hessenberg.  Build one with [`lhl`](@ref) or [`lhl!`](@ref).
 
 `factors` holds `H` in `triu(factors, -1)` and the step-`k` multipliers in the annihilated
 positions `factors[k+2:n, k]`, exactly the way an LU packs its own; `Lp` holds the same
-multipliers packed column after column with no gaps (`applyZ!`/`applyZinv!` stream it as
-one contiguous array, which the hardware prefetcher follows across column ends).  `Ht` and `Gt` hold
+multipliers repacked for the solves (see `_lhl_lpack!`: groups of four columns interleaved
+in `W`-row tiles, zero padded, so that a rank-4 sweep reads one contiguous stream with no
+remainder loop).  `perm`/`iperm` are the pivot permutation `P` and its inverse, `iscale`
+the reciprocals of the balancing `scale` (powers of two, so exact), and `xbuf` a padded
+copy of the right-hand side the solves work in.  `Ht` and `Gt` hold
 `H` and the LU of `I - γH` **transposed**: the Hessenberg elimination sweeps rows, and in
 a column-major array the transposed layout turns every inner loop of the per-γ work
-(fused rebuild and elimination, back substitution) into a contiguous one; `rdiag` holds the
-reciprocals of the pivots of that LU.  `resid` doubles
+(fused rebuild and elimination, back substitution) into a contiguous one; `Gt` has `W`
+extra zero rows below row `n` so the back substitution's dot products run to a full
+vector.  `rdiag` holds the reciprocals of the pivots of that LU.  `resid` doubles
 as scratch for the reduction and for `lhl_shift!`; `Ht` and `Gt` are scratch during the
 reduction, which fills `Ht` last.
 """
@@ -73,12 +77,16 @@ mutable struct LHLWorkspace{T, Tr}
     factors::Matrix{T}
     Lp::Vector{T}
     ipiv::Vector{Int}
+    perm::Vector{Int}
+    iperm::Vector{Int}
     scale::Vector{Tr}
+    iscale::Vector{Tr}
     Ht::Matrix{T}
     Gt::Matrix{T}
     rdiag::Vector{T}
     swap::Vector{Bool}
     resid::Vector{T}
+    xbuf::Vector{T}
     σ::T
     τ::T
     # Whether `factors` holds a valid reduction. A consumer tracking *whose* Jacobian it
@@ -90,29 +98,61 @@ end
 
 function LHLWorkspace{T}(n::Integer) where {T}
     Tr = real(T)
+    W = _lhl_tilew(T)
     return LHLWorkspace{T, Tr}(
-        Matrix{T}(undef, n, n), Vector{T}(undef, _lhl_lpack_len(n)),
-        Vector{Int}(undef, max(n - 2, 0)), ones(Tr, n),
-        Matrix{T}(undef, n, n), Matrix{T}(undef, n, n), Vector{T}(undef, n),
-        Vector{Bool}(undef, n), Vector{T}(undef, n), zero(T), zero(T), false, n, 0
+        Matrix{T}(undef, n, n), Vector{T}(undef, _lhl_lpack_len(n, W)),
+        Vector{Int}(undef, max(n - 2, 0)), collect(1:n), collect(1:n), ones(Tr, n), ones(Tr, n),
+        Matrix{T}(undef, n, n), zeros(T, n + W, n), Vector{T}(undef, n),
+        Vector{Bool}(undef, n), Vector{T}(undef, n), zeros(T, n + W), zero(T), zero(T), false, n, 0
     )
 end
 
-# Multipliers of step k occupy Lp[_lhl_loff(k, n) .+ (1:n-k-1)] (rows k+2:n).
-_lhl_loff(k::Int, n::Int) = (k - 1) * (n - 2) - ((k - 1) * (k - 2)) >> 1
-_lhl_lpack_len(n::Int) = n >= 3 ? _lhl_loff(n - 1, n) : 0
+# Rows per tile of the packed multipliers and of the buffer padding: one vector register
+# for the explicit kernels, a fixed 8 for the generic sweeps.
+_lhl_tilew(::Type{T}) where {T} = T <: Union{Float32, Float64} ? _LHL_VEC_BYTES ÷ sizeof(T) : 8
+
+# Layout of `Lp` (multipliers of steps 1:n-2, rows k+2:n of step k).  Steps come in groups of
+# four, k = 4g-3, g = 1:(n-2)÷4: eight head slots holding the 3×3 triangle rows k+2:k+4 in
+# the order l[k+2,k]; l[k+3,k], l[k+3,k+1]; l[k+4,k], l[k+4,k+1], l[k+4,k+2]; then the body,
+# rows k+5:n of the four columns zero padded to mp = cld(n-k-4, W)·W rows.  For the
+# explicit kernels below 2 MiB (`_lhl_tiled`) the body is tiled — W rows of column 0, W
+# rows of column 1, ... — so a rank-4 sweep reads one stream; otherwise it is four plain
+# columns, which the hardware prefetcher streams from L3/DRAM faster than one stream four
+# times as fast, and which the generic sweeps vectorize as long loops.  The remaining
+# steps 4G+1:n-2 follow one at a time as plain zero-padded columns.
+const _LHL_HEAD = 8
+_lhl_tiled(n::Int, ::Type{T}) where {T} =
+    T <: Union{Float32, Float64} && n * n * sizeof(T) <= 4 * 2^20
+_lhl_group_size(n::Int, k::Int, W::Int) = _LHL_HEAD + 4 * cld(n - k - 4, W) * W
+_lhl_single_size(n::Int, k::Int, W::Int) = cld(n - k - 1, W) * W
+function _lhl_lpack_len(n::Int, W::Int)
+    len = 0
+    G = max(n - 2, 0) >> 2
+    for g in 1:G
+        len += _lhl_group_size(n, 4g - 3, W)
+    end
+    for k in (4G + 1):(n - 2)
+        len += _lhl_single_size(n, k, W)
+    end
+    return len
+end
 
 function _lhl_resize!(ws::LHLWorkspace{T}, n::Int) where {T}
     n == ws.n && size(ws.factors, 1) == n && return ws
+    W = _lhl_tilew(T)
     ws.factors = Matrix{T}(undef, n, n)
     ws.Ht = Matrix{T}(undef, n, n)
-    ws.Gt = Matrix{T}(undef, n, n)
-    resize!(ws.Lp, _lhl_lpack_len(n))
+    ws.Gt = zeros(T, n + W, n)
+    resize!(ws.Lp, _lhl_lpack_len(n, W))
     resize!(ws.ipiv, max(n - 2, 0))
+    resize!(ws.perm, n)
+    resize!(ws.iperm, n)
     resize!(ws.scale, n)
+    resize!(ws.iscale, n)
     resize!(ws.rdiag, n)
     resize!(ws.swap, n)
     resize!(ws.resid, n)
+    resize!(ws.xbuf, n + W)
     ws.n = n
     ws.reduced = false
     return ws
@@ -187,6 +227,11 @@ function lhl_reduce!(ws::LHLWorkspace{T}, J::AbstractMatrix, balance::Bool) wher
     end
     if n >= _lhl_block_min(T)
         _lhl_reduce_blocked!(A, ws.ipiv, ws.Ht, ws.resid, ws.Gt, _lhl_panel_width(n))
+        # Gt was scratch; the solves need its pad rows zero again.
+        Gt = ws.Gt
+        @inbounds for j in 1:n, i in (n + 1):size(Gt, 1)
+            Gt[i, j] = zero(T)
+        end
     else
         _lhl_reduce_unblocked!(A, ws.ipiv)
     end
@@ -194,15 +239,83 @@ function lhl_reduce!(ws::LHLWorkspace{T}, J::AbstractMatrix, balance::Bool) wher
     @inbounds for j in 1:n, i in 1:min(j + 1, n)
         Ht[j, i] = A[i, j]
     end
-    Lp = ws.Lp
+    _lhl_lpack!(ws.Lp, A, n, Val(_lhl_tilew(T)))
+    perm = ws.perm
+    iperm = ws.iperm
+    d = ws.scale
+    isc = ws.iscale
+    @inbounds @simd for i in 1:n
+        perm[i] = i
+        isc[i] = inv(d[i])
+    end
     @inbounds for k in 1:(n - 2)
-        o = _lhl_loff(k, n) - k - 1
-        @simd for i in (k + 2):n
-            Lp[o + i] = A[i, k]
-        end
+        p = ws.ipiv[k]
+        perm[k + 1], perm[p] = perm[p], perm[k + 1]
+    end
+    @inbounds for i in 1:n
+        iperm[perm[i]] = i
     end
     ws.reduced = true
     return ws
+end
+
+function _lhl_lpack!(Lp::Vector{T}, A::AbstractMatrix{T}, n::Int, ::Val{W}) where {T, W}
+    G = max(n - 2, 0) >> 2
+    tiled = _lhl_tiled(n, T)
+    o = 0
+    @inbounds for g in 1:G
+        k = 4g - 3
+        Lp[o + 1] = A[k + 2, k]
+        Lp[o + 2] = A[k + 3, k]
+        Lp[o + 3] = A[k + 3, k + 1]
+        Lp[o + 4] = A[k + 4, k]
+        Lp[o + 5] = A[k + 4, k + 1]
+        Lp[o + 6] = A[k + 4, k + 2]
+        o += _LHL_HEAD
+        m = n - k - 4
+        mp = cld(m, W) * W
+        if tiled
+            # tile t of column c starts at o + t*4W + c*W
+            for c in 0:3
+                ob = o + c * W
+                i = 0
+                while i + W <= m
+                    for r in 1:W
+                        Lp[ob + r] = A[k + 4 + i + r, k + c]
+                    end
+                    ob += 4W
+                    i += W
+                end
+                if i < m
+                    for r in 1:W
+                        Lp[ob + r] = i + r <= m ? A[k + 4 + i + r, k + c] : zero(T)
+                    end
+                end
+            end
+        else
+            for c in 0:3
+                ob = o + c * mp
+                @simd for i in 1:m
+                    Lp[ob + i] = A[k + 4 + i, k + c]
+                end
+                for i in (m + 1):mp
+                    Lp[ob + i] = zero(T)
+                end
+            end
+        end
+        o += 4mp
+    end
+    @inbounds for k in (4G + 1):(n - 2)
+        m = n - k - 1
+        @simd for i in 1:m
+            Lp[o + i] = A[k + 1 + i, k]
+        end
+        for i in (m + 1):(cld(m, W) * W)
+            Lp[o + i] = zero(T)
+        end
+        o += cld(m, W) * W
+    end
+    return Lp
 end
 
 function _lhl_reduce_unblocked!(A::AbstractMatrix{T}, ipiv) where {T}
@@ -885,16 +998,31 @@ end
 
 `x ← Z x`.  `n²/2` multiply–adds.
 """
-function applyZ!(x::AbstractVector, ws::LHLWorkspace)
+function applyZ!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
     n = ws.n
-    _lhl_zsweep!(x, ws.Lp, n)
-    @inbounds for k in (n - 2):-1:1
-        p = ws.ipiv[k]
-        p != k + 1 && ((x[k + 1], x[p]) = (x[p], x[k + 1]))
-    end
-    d = ws.scale
-    @inbounds @simd for i in 1:n
-        x[i] *= d[i]
+    length(x) == n || throw(DimensionMismatch("x has length $(length(x)), the workspace is $n×$n"))
+    if eltype(x) === T
+        y = ws.xbuf
+        @inbounds for i in 1:n
+            y[i] = x[i]
+        end
+        _lhl_zero_pad!(y, n)
+        _lhl_zsweep_buf!(y, ws.Lp, n)
+        d = ws.scale
+        ip = ws.iperm
+        @inbounds for i in 1:n
+            x[i] = y[ip[i]] * d[i]
+        end
+    else
+        _lhl_zsweep!(x, ws.Lp, n)
+        @inbounds for k in (n - 2):-1:1
+            p = ws.ipiv[k]
+            p != k + 1 && ((x[k + 1], x[p]) = (x[p], x[k + 1]))
+        end
+        d = ws.scale
+        @inbounds @simd for i in 1:n
+            x[i] *= d[i]
+        end
     end
     return x
 end
@@ -904,218 +1032,262 @@ end
 
 `x ← Z⁻¹x`.  `n²/2` multiply–adds.
 """
-function applyZinv!(x::AbstractVector, ws::LHLWorkspace)
+function applyZinv!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
     n = ws.n
-    d = ws.scale
-    @inbounds @simd for i in 1:n
-        x[i] /= d[i]
-    end
-    @inbounds for k in 1:(n - 2)
-        p = ws.ipiv[k]
-        p != k + 1 && ((x[k + 1], x[p]) = (x[p], x[k + 1]))
-    end
-    _lhl_zinvsweep!(x, ws.Lp, n)
-    return x
-end
-
-# x ← L x, four columns per sweep.  Column k uses x[k+1], which columns k-1, k-2, k-3
-# (applied after it) do not touch, so all four scalars are read up front and only rows
-# k-1:k+1 need the sequential order.
-function _lhl_zsweep!(x::AbstractVector, Lp::AbstractVector{T}, n::Int) where {T}
-    k = n - 2
-    @inbounds while k - 3 >= 1
-        o1 = _lhl_loff(k, n) - k - 1
-        o2 = _lhl_loff(k - 1, n) - k
-        o3 = _lhl_loff(k - 2, n) - k + 1
-        o4 = _lhl_loff(k - 3, n) - k + 2
-        x1 = x[k + 1]
-        x2 = x[k]
-        x3 = x[k - 1]
-        x4 = x[k - 2]
-        x[k - 1] += Lp[o4 + k - 1] * x4
-        x[k] += Lp[o3 + k] * x3 + Lp[o4 + k] * x4
-        x[k + 1] += (Lp[o2 + k + 1] * x2 + Lp[o3 + k + 1] * x3) + Lp[o4 + k + 1] * x4
-        @simd for i in (k + 2):n
-            x[i] += (Lp[o1 + i] * x1 + Lp[o2 + i] * x2) + (Lp[o3 + i] * x3 + Lp[o4 + i] * x4)
+    length(x) == n || throw(DimensionMismatch("x has length $(length(x)), the workspace is $n×$n"))
+    if eltype(x) === T
+        y = ws.xbuf
+        _lhl_gather!(y, x, ws)
+        _lhl_zinvsweep_buf!(y, ws.Lp, n)
+        @inbounds for i in 1:n
+            x[i] = y[i]
         end
-        k -= 4
-    end
-    @inbounds while k >= 1
-        xk = x[k + 1]
-        o1 = _lhl_loff(k, n) - k - 1
-        @simd for i in (k + 2):n
-            x[i] += Lp[o1 + i] * xk
+    else
+        d = ws.scale
+        @inbounds @simd for i in 1:n
+            x[i] /= d[i]
         end
-        k -= 1
+        @inbounds for k in 1:(n - 2)
+            p = ws.ipiv[k]
+            p != k + 1 && ((x[k + 1], x[p]) = (x[p], x[k + 1]))
+        end
+        _lhl_zinvsweep!(x, ws.Lp, n)
     end
     return x
 end
 
-# x ← L⁻¹ x, four columns per sweep; x[k+2:k+4] are finished sequentially first because
-# each column's scalar depends on the previous column's update.
+# y ← P⁻¹D⁻¹x into the padded buffer (the pad stays zero through the sweeps: the padded
+# multipliers are zero).
+function _lhl_gather!(y::Vector, x::AbstractVector, ws::LHLWorkspace)
+    n = ws.n
+    perm = ws.perm
+    isc = ws.iscale
+    @inbounds for i in 1:n
+        p = perm[i]
+        y[i] = x[p] * isc[p]
+    end
+    _lhl_zero_pad!(y, n)
+    return y
+end
+function _lhl_zero_pad!(y::Vector{T}, n::Int) where {T}
+    @inbounds for i in (n + 1):length(y)
+        y[i] = zero(T)
+    end
+    return y
+end
+
+# In-place sweeps for any vector type on the packed `Lp` (see `_lhl_lpack!`).  x ← L⁻¹x: the
+# head of a group of four steps is a serial 3-step recurrence, then rows k+5:n take all
+# four columns at once.
 function _lhl_zinvsweep!(x::AbstractVector, Lp::AbstractVector{T}, n::Int) where {T}
-    k = 1
-    @inbounds while k + 3 <= n - 2
-        o1 = _lhl_loff(k, n) - k - 1
-        o2 = _lhl_loff(k + 1, n) - k - 2
-        o3 = _lhl_loff(k + 2, n) - k - 3
-        o4 = _lhl_loff(k + 3, n) - k - 4
+    W = _lhl_tilew(T)
+    tiled = _lhl_tiled(n, T)
+    G = max(n - 2, 0) >> 2
+    o = 0
+    @inbounds for g in 1:G
+        k = 4g - 3
         x1 = x[k + 1]
-        x2 = x[k + 2] - Lp[o1 + k + 2] * x1
+        x2 = x[k + 2] - Lp[o + 1] * x1
         x[k + 2] = x2
-        x3 = x[k + 3] - (Lp[o1 + k + 3] * x1 + Lp[o2 + k + 3] * x2)
+        x3 = x[k + 3] - (Lp[o + 2] * x1 + Lp[o + 3] * x2)
         x[k + 3] = x3
-        x4 = x[k + 4] - ((Lp[o1 + k + 4] * x1 + Lp[o2 + k + 4] * x2) + Lp[o3 + k + 4] * x3)
+        x4 = x[k + 4] - ((Lp[o + 4] * x1 + Lp[o + 5] * x2) + Lp[o + 6] * x3)
         x[k + 4] = x4
-        @simd for i in (k + 5):n
-            x[i] -= (Lp[o1 + i] * x1 + Lp[o2 + i] * x2) + (Lp[o3 + i] * x3 + Lp[o4 + i] * x4)
-        end
-        k += 4
-    end
-    @inbounds while k <= n - 2
-        xk = x[k + 1]
-        o1 = _lhl_loff(k, n) - k - 1
-        @simd for i in (k + 2):n
-            x[i] -= Lp[o1 + i] * xk
-        end
-        k += 1
-    end
-    return x
-end
-
-# Explicit W-wide kernels for the two sweeps: same rank-4 structure, but a single vector
-# loop with a ≤W-1 scalar tail and no alias check per column block, which is what the
-# short trip counts at n ≤ 256 need.
-function _lhl_zsweep!(x::Vector{T}, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
-    sz = sizeof(T)
-    k = n - 2
-    GC.@preserve x Lp begin
-        px = pointer(x)
-        pL = pointer(Lp)
-        @inbounds while k - 3 >= 1
-            c1 = pL + _lhl_loff(k, n) * sz
-            c2 = pL + _lhl_loff(k - 1, n) * sz
-            c3 = pL + _lhl_loff(k - 2, n) * sz
-            c4 = pL + _lhl_loff(k - 3, n) * sz
-            x1 = x[k + 1]
-            x2 = x[k]
-            x3 = x[k - 1]
-            x4 = x[k - 2]
-            x[k - 1] = muladd(unsafe_load(c4), x4, x[k - 1])
-            x[k] = muladd(unsafe_load(c3), x3, muladd(unsafe_load(c4, 2), x4, x[k]))
-            x[k + 1] = muladd(
-                unsafe_load(c2), x2, muladd(unsafe_load(c3, 2), x3, muladd(unsafe_load(c4, 3), x4, x[k + 1]))
-            )
-            b1 = _lhl_bcast(V, x1)
-            b2 = _lhl_bcast(V, x2)
-            b3 = _lhl_bcast(V, x3)
-            b4 = _lhl_bcast(V, x4)
-            i = k + 2
-            p1 = c1
-            p2 = c2 + sz
-            p3 = c3 + 2sz
-            p4 = c4 + 3sz
-            q = px + (i - 1) * sz
-            while i + W - 1 <= n
-                v = _lhl_vload(V, q)
-                v = _lhl_fma(_lhl_vload(V, p1), b1, v)
-                v = _lhl_fma(_lhl_vload(V, p2), b2, v)
-                v = _lhl_fma(_lhl_vload(V, p3), b3, v)
-                v = _lhl_fma(_lhl_vload(V, p4), b4, v)
-                _lhl_vstore!(q, v)
-                p1 += W * sz; p2 += W * sz; p3 += W * sz; p4 += W * sz; q += W * sz
+        o += _LHL_HEAD
+        m = n - k - 4
+        mp = cld(m, W) * W
+        if tiled
+            oc = o
+            i = k + 5
+            while i <= n
+                rows = min(W, n - i + 1)
+                @simd for r in 1:rows
+                    x[i + r - 1] -= (Lp[oc + r] * x1 + Lp[oc + W + r] * x2) + (Lp[oc + 2W + r] * x3 + Lp[oc + 3W + r] * x4)
+                end
+                oc += 4W
                 i += W
             end
-            while i <= n
-                v = unsafe_load(q)
-                v = muladd(unsafe_load(p1), x1, v)
-                v = muladd(unsafe_load(p2), x2, v)
-                v = muladd(unsafe_load(p3), x3, v)
-                v = muladd(unsafe_load(p4), x4, v)
-                unsafe_store!(q, v)
-                p1 += sz; p2 += sz; p3 += sz; p4 += sz; q += sz
-                i += 1
+        else
+            @simd for i in 1:m
+                x[k + 4 + i] -= (Lp[o + i] * x1 + Lp[o + mp + i] * x2) + (Lp[o + 2mp + i] * x3 + Lp[o + 3mp + i] * x4)
             end
-            k -= 4
         end
-        @inbounds while k >= 1
-            xk = x[k + 1]
-            o1 = _lhl_loff(k, n) - k - 1
-            @simd for i in (k + 2):n
-                x[i] = muladd(Lp[o1 + i], xk, x[i])
+        o += 4mp
+    end
+    @inbounds for k in (4G + 1):(n - 2)
+        xk = x[k + 1]
+        m = n - k - 1
+        @simd for i in 1:m
+            x[k + 1 + i] -= Lp[o + i] * xk
+        end
+        o += cld(m, W) * W
+    end
+    return x
+end
+
+# x ← L x: steps in reverse order; a group reads its four scalars first, since step k+c
+# only touches rows k+c+2:n.
+function _lhl_zsweep!(x::AbstractVector, Lp::AbstractVector{T}, n::Int) where {T}
+    W = _lhl_tilew(T)
+    tiled = _lhl_tiled(n, T)
+    G = max(n - 2, 0) >> 2
+    o = length(Lp)
+    @inbounds for k in (n - 2):-1:(4G + 1)
+        xk = x[k + 1]
+        m = n - k - 1
+        o -= cld(m, W) * W
+        @simd for i in 1:m
+            x[k + 1 + i] += Lp[o + i] * xk
+        end
+    end
+    @inbounds for g in G:-1:1
+        k = 4g - 3
+        o -= _lhl_group_size(n, k, W)
+        x1 = x[k + 1]
+        x2 = x[k + 2]
+        x3 = x[k + 3]
+        x4 = x[k + 4]
+        x[k + 2] = x2 + Lp[o + 1] * x1
+        x[k + 3] = x3 + (Lp[o + 2] * x1 + Lp[o + 3] * x2)
+        x[k + 4] = x4 + ((Lp[o + 4] * x1 + Lp[o + 5] * x2) + Lp[o + 6] * x3)
+        ob = o + _LHL_HEAD
+        m = n - k - 4
+        mp = cld(m, W) * W
+        if tiled
+            oc = ob
+            i = k + 5
+            while i <= n
+                rows = min(W, n - i + 1)
+                @simd for r in 1:rows
+                    x[i + r - 1] += (Lp[oc + r] * x1 + Lp[oc + W + r] * x2) + (Lp[oc + 2W + r] * x3 + Lp[oc + 3W + r] * x4)
+                end
+                oc += 4W
+                i += W
             end
-            k -= 1
+        else
+            @simd for i in 1:m
+                x[k + 4 + i] += (Lp[ob + i] * x1 + Lp[ob + mp + i] * x2) + (Lp[ob + 2mp + i] * x3 + Lp[ob + 3mp + i] * x4)
+            end
         end
     end
     return x
 end
 
-function _lhl_zinvsweep!(x::Vector{T}, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
+# The same sweeps on the padded buffer `ws.xbuf` (length ≥ n + W, zero past n): every tile
+# is a full vector, so there is no remainder loop and no branch on the row count.
+_lhl_zinvsweep_buf!(y::AbstractVector, Lp::AbstractVector, n::Int) = _lhl_zinvsweep!(y, Lp, n)
+_lhl_zsweep_buf!(y::AbstractVector, Lp::AbstractVector, n::Int) = _lhl_zsweep!(y, Lp, n)
+
+function _lhl_zinvsweep_buf!(y::Vector{T}, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
     V = _lhl_vectype(T)
     W = _LHL_VEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
-    k = 1
-    GC.@preserve x Lp begin
-        px = pointer(x)
-        pL = pointer(Lp)
-        @inbounds while k + 3 <= n - 2
-            c1 = pL + _lhl_loff(k, n) * sz
-            c2 = pL + _lhl_loff(k + 1, n) * sz
-            c3 = pL + _lhl_loff(k + 2, n) * sz
-            c4 = pL + _lhl_loff(k + 3, n) * sz
-            x1 = x[k + 1]
-            x2 = muladd(-unsafe_load(c1), x1, x[k + 2])
-            x[k + 2] = x2
-            x3 = muladd(-unsafe_load(c2), x2, muladd(-unsafe_load(c1, 2), x1, x[k + 3]))
-            x[k + 3] = x3
-            x4 = muladd(
-                -unsafe_load(c3), x3, muladd(-unsafe_load(c2, 2), x2, muladd(-unsafe_load(c1, 3), x1, x[k + 4]))
-            )
-            x[k + 4] = x4
+    tiled = _lhl_tiled(n, T)
+    G = max(n - 2, 0) >> 2
+    GC.@preserve y Lp begin
+        py = pointer(y)
+        h = pointer(Lp)
+        @inbounds for g in 1:G
+            k = 4g - 3
+            x1 = y[k + 1]
+            x2 = muladd(-unsafe_load(h), x1, y[k + 2])
+            y[k + 2] = x2
+            x3 = muladd(-unsafe_load(h, 3), x2, muladd(-unsafe_load(h, 2), x1, y[k + 3]))
+            y[k + 3] = x3
+            x4 = muladd(-unsafe_load(h, 6), x3, muladd(-unsafe_load(h, 5), x2, muladd(-unsafe_load(h, 4), x1, y[k + 4])))
+            y[k + 4] = x4
             b1 = _lhl_bcast(V, -x1)
             b2 = _lhl_bcast(V, -x2)
             b3 = _lhl_bcast(V, -x3)
             b4 = _lhl_bcast(V, -x4)
-            i = k + 5
-            p1 = c1 + 3sz
-            p2 = c2 + 2sz
-            p3 = c3 + sz
-            p4 = c4
-            q = px + (i - 1) * sz
-            while i + W - 1 <= n
+            p = h + _LHL_HEAD * sz
+            q = py + (k + 4) * sz
+            mpb = cld(n - k - 4, W) * W * sz
+            h = p + 4mpb
+            # byte distance between the four columns' rows, and the advance per vector
+            cs = tiled ? W * sz : mpb
+            pa = tiled ? 4W * sz : W * sz
+            pend = tiled ? h : p + mpb
+            while p < pend
                 v = _lhl_vload(V, q)
-                v = _lhl_fma(_lhl_vload(V, p1), b1, v)
-                v = _lhl_fma(_lhl_vload(V, p2), b2, v)
-                v = _lhl_fma(_lhl_vload(V, p3), b3, v)
-                v = _lhl_fma(_lhl_vload(V, p4), b4, v)
+                v = _lhl_fma(_lhl_vload(V, p), b1, v)
+                v = _lhl_fma(_lhl_vload(V, p + cs), b2, v)
+                v = _lhl_fma(_lhl_vload(V, p + 2cs), b3, v)
+                v = _lhl_fma(_lhl_vload(V, p + 3cs), b4, v)
                 _lhl_vstore!(q, v)
-                p1 += W * sz; p2 += W * sz; p3 += W * sz; p4 += W * sz; q += W * sz
-                i += W
+                p += pa
+                q += W * sz
             end
-            while i <= n
-                v = unsafe_load(q)
-                v = muladd(-unsafe_load(p1), x1, v)
-                v = muladd(-unsafe_load(p2), x2, v)
-                v = muladd(-unsafe_load(p3), x3, v)
-                v = muladd(-unsafe_load(p4), x4, v)
-                unsafe_store!(q, v)
-                p1 += sz; p2 += sz; p3 += sz; p4 += sz; q += sz
-                i += 1
-            end
-            k += 4
         end
-        @inbounds while k <= n - 2
-            xk = x[k + 1]
-            o1 = _lhl_loff(k, n) - k - 1
-            @simd for i in (k + 2):n
-                x[i] = muladd(-Lp[o1 + i], xk, x[i])
+        @inbounds for k in (4G + 1):(n - 2)
+            b = _lhl_bcast(V, -y[k + 1])
+            q = py + (k + 1) * sz
+            pend = h + cld(n - k - 1, W) * W * sz
+            while h < pend
+                _lhl_vstore!(q, _lhl_fma(_lhl_vload(V, h), b, _lhl_vload(V, q)))
+                h += W * sz
+                q += W * sz
             end
-            k += 1
         end
     end
-    return x
+    return y
+end
+
+function _lhl_zsweep_buf!(y::Vector{T}, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    tiled = _lhl_tiled(n, T)
+    G = max(n - 2, 0) >> 2
+    GC.@preserve y Lp begin
+        py = pointer(y)
+        h = pointer(Lp) + length(Lp) * sz
+        @inbounds for k in (n - 2):-1:(4G + 1)
+            b = _lhl_bcast(V, y[k + 1])
+            m = cld(n - k - 1, W) * W
+            h -= m * sz
+            p = h
+            q = py + (k + 1) * sz
+            pend = p + m * sz
+            while p < pend
+                _lhl_vstore!(q, _lhl_fma(_lhl_vload(V, p), b, _lhl_vload(V, q)))
+                p += W * sz
+                q += W * sz
+            end
+        end
+        @inbounds for g in G:-1:1
+            k = 4g - 3
+            h -= _lhl_group_size(n, k, W) * sz
+            x1 = y[k + 1]
+            x2 = y[k + 2]
+            x3 = y[k + 3]
+            x4 = y[k + 4]
+            y[k + 2] = muladd(unsafe_load(h), x1, x2)
+            y[k + 3] = muladd(unsafe_load(h, 3), x2, muladd(unsafe_load(h, 2), x1, x3))
+            y[k + 4] = muladd(unsafe_load(h, 6), x3, muladd(unsafe_load(h, 5), x2, muladd(unsafe_load(h, 4), x1, x4)))
+            b1 = _lhl_bcast(V, x1)
+            b2 = _lhl_bcast(V, x2)
+            b3 = _lhl_bcast(V, x3)
+            b4 = _lhl_bcast(V, x4)
+            p = h + _LHL_HEAD * sz
+            q = py + (k + 4) * sz
+            mpb = cld(n - k - 4, W) * W * sz
+            cs = tiled ? W * sz : mpb
+            pa = tiled ? 4W * sz : W * sz
+            pend = tiled ? p + 4mpb : p + mpb
+            while p < pend
+                v = _lhl_vload(V, q)
+                v = _lhl_fma(_lhl_vload(V, p), b1, v)
+                v = _lhl_fma(_lhl_vload(V, p + cs), b2, v)
+                v = _lhl_fma(_lhl_vload(V, p + 2cs), b3, v)
+                v = _lhl_fma(_lhl_vload(V, p + 3cs), b4, v)
+                _lhl_vstore!(q, v)
+                p += pa
+                q += W * sz
+            end
+        end
+    end
+    return y
 end
 
 # ---------------------------------------------------------------------------
@@ -1199,18 +1371,9 @@ end
 
 function _hessenberg_solve!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
     Gt = ws.Gt
-    swap = ws.swap
     rd = ws.rdiag
     n = ws.n
-    # The interchange is a select, not a branch: the pivot pattern is data and mispredicts.
-    @inbounds for k in 1:(n - 1)
-        s = swap[k]
-        a = x[k]
-        b = x[k + 1]
-        xk = ifelse(s, b, a)
-        x[k] = xk
-        x[k + 1] = ifelse(s, a, b) - Gt[k, k + 1] * xk
-    end
+    _lhl_hess_forward!(x, Gt, ws.swap, n)
     # Back substitution four rows at a time.  The dot products of block j-4:j-7 over
     # x[j+1:n] do not depend on x[j-3:j], so they are issued right after the 4×4 triangle of
     # block j: the vector loop overlaps the serial chain instead of waiting for it.
@@ -1265,18 +1428,125 @@ function _hessenberg_solve!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
     return x
 end
 
+# The interchange is a select, not a branch: the pivot pattern is data and mispredicts.
+function _lhl_hess_forward!(x::AbstractVector, Gt::AbstractMatrix, swap::Vector{Bool}, n::Int)
+    @inbounds for k in 1:(n - 1)
+        s = swap[k]
+        a = x[k]
+        b = x[k + 1]
+        xk = ifelse(s, b, a)
+        x[k] = xk
+        x[k + 1] = ifelse(s, a, b) - Gt[k, k + 1] * xk
+    end
+    return x
+end
+
+# On the padded buffer: same pipelining, the four dot products as vector accumulators
+# running to a full vector past n (Gt's pad rows and y's pad are zero).
+_hessenberg_solve_buf!(y::AbstractVector, ws::LHLWorkspace) = _hessenberg_solve!(y, ws)
+
+function _hessenberg_solve_buf!(y::Vector{T}, ws::LHLWorkspace{T}) where {T <: Union{Float32, Float64}}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    Gt = ws.Gt
+    rd = ws.rdiag
+    n = ws.n
+    ldg = size(Gt, 1)
+    _lhl_hess_forward!(y, Gt, ws.swap, n)
+    GC.@preserve y Gt begin
+        py = pointer(y)
+        pG = pointer(Gt)
+        j = n
+        s1 = zero(T)
+        s2 = zero(T)
+        s3 = zero(T)
+        s4 = zero(T)
+        @inbounds while j - 3 >= 1
+            xj = (y[j] - s1) * rd[j]
+            y[j] = xj
+            s2 = muladd(Gt[j, j - 1], xj, s2)
+            s3 = muladd(Gt[j, j - 2], xj, s3)
+            s4 = muladd(Gt[j, j - 3], xj, s4)
+            xj1 = (y[j - 1] - s2) * rd[j - 1]
+            y[j - 1] = xj1
+            s3 = muladd(Gt[j - 1, j - 2], xj1, s3)
+            s4 = muladd(Gt[j - 1, j - 3], xj1, s4)
+            xj2 = (y[j - 2] - s3) * rd[j - 2]
+            y[j - 2] = xj2
+            s4 = muladd(Gt[j - 2, j - 3], xj2, s4)
+            xj3 = (y[j - 3] - s4) * rd[j - 3]
+            y[j - 3] = xj3
+            jn = j - 4
+            if jn - 3 >= 1
+                c1 = pG + ((jn - 1) * ldg + j) * sz
+                c2 = c1 - ldg * sz
+                c3 = c2 - ldg * sz
+                c4 = c3 - ldg * sz
+                q = py + j * sz
+                mb = cld(n - j, W) * W * sz
+                a1 = _lhl_bcast(V, zero(T))
+                a2 = a1
+                a3 = a1
+                a4 = a1
+                o = 0
+                while o < mb
+                    v = _lhl_vload(V, q + o)
+                    a1 = _lhl_fma(_lhl_vload(V, c1 + o), v, a1)
+                    a2 = _lhl_fma(_lhl_vload(V, c2 + o), v, a2)
+                    a3 = _lhl_fma(_lhl_vload(V, c3 + o), v, a3)
+                    a4 = _lhl_fma(_lhl_vload(V, c4 + o), v, a4)
+                    o += W * sz
+                end
+                s1 = _lhl_vsum(a1) + ((Gt[j, jn] * xj + Gt[j - 1, jn] * xj1) + (Gt[j - 2, jn] * xj2 + Gt[j - 3, jn] * xj3))
+                s2 = _lhl_vsum(a2) + ((Gt[j, jn - 1] * xj + Gt[j - 1, jn - 1] * xj1) + (Gt[j - 2, jn - 1] * xj2 + Gt[j - 3, jn - 1] * xj3))
+                s3 = _lhl_vsum(a3) + ((Gt[j, jn - 2] * xj + Gt[j - 1, jn - 2] * xj1) + (Gt[j - 2, jn - 2] * xj2 + Gt[j - 3, jn - 2] * xj3))
+                s4 = _lhl_vsum(a4) + ((Gt[j, jn - 3] * xj + Gt[j - 1, jn - 3] * xj1) + (Gt[j - 2, jn - 3] * xj2 + Gt[j - 3, jn - 3] * xj3))
+            end
+            j = jn
+        end
+        @inbounds while j >= 1
+            s = zero(T)
+            @simd for i in (j + 1):n
+                s += Gt[i, j] * y[i]
+            end
+            y[j] = (y[j] - s) * rd[j]
+            j -= 1
+        end
+    end
+    return y
+end
+
+@inline _lhl_vsum(v::NTuple{W, VecElement{T}}) where {W, T} = sum(ntuple(w -> v[w].value, Val(W)))
+
 """
     lhl_ldiv!(x, ws)
 
 `x ← W⁻¹x` for the `W` currently loaded by [`lhl_shift!`](@ref): `Z⁻¹`, Hessenberg solve,
 `Z`.  `3n²/2` multiply–adds.
 """
-function lhl_ldiv!(x::AbstractVector, ws::LHLWorkspace)
-    applyZinv!(x, ws)
-    _hessenberg_solve!(x, ws)
-    applyZ!(x, ws)
+function lhl_ldiv!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
+    n = ws.n
+    length(x) == n || throw(DimensionMismatch("x has length $(length(x)), the workspace is $n×$n"))
+    if eltype(x) === T
+        y = ws.xbuf
+        _lhl_gather!(y, x, ws)
+        _lhl_zinvsweep_buf!(y, ws.Lp, n)
+        _hessenberg_solve_buf!(y, ws)
+        _lhl_zsweep_buf!(y, ws.Lp, n)
+        d = ws.scale
+        ip = ws.iperm
+        @inbounds for i in 1:n
+            x[i] = y[ip[i]] * d[i]
+        end
+    else
+        applyZinv!(x, ws)
+        _hessenberg_solve!(x, ws)
+        applyZ!(x, ws)
+    end
     return x
 end
+
 
 """
     lhl_refine!(x, A, b, ws, steps)
