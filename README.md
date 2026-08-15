@@ -1,6 +1,6 @@
-# LHL.jl
+# LHLFactorization.jl
 
-[![CI](https://github.com/SciML/LHL.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/SciML/LHL.jl/actions/workflows/CI.yml?query=branch%3Amaster)
+[![CI](https://github.com/SciML/LHLFactorization.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/SciML/LHLFactorization.jl/actions/workflows/CI.yml?query=branch%3Amaster)
 [![SciML Code Style](https://img.shields.io/static/v1?label=code%20style&message=SciML&color=9558b2&labelColor=389826)](https://github.com/SciML/SciMLStyle)
 
 Solve a whole family of shifted linear systems
@@ -25,7 +25,7 @@ The shift never reaches `Z`, so
 σI + τJ = Z (σI + τH) Z⁻¹
 ```
 
-and `σI + τH` is Hessenberg — its LU is `O(n²)`, not `O(n³)`. LHL.jl does the reduction by
+and `σI + τH` is Hessenberg — its LU is `O(n²)`, not `O(n³)`. LHLFactorization.jl does the reduction by
 Gaussian elimination-style similarity transformations with partial pivoting (Wilkinson's
 elimination method, EISPACK's `ELMHES`), giving `Z = D·P·L` with `L` unit lower triangular,
 `P` a permutation and `D` a balancing diagonal — hence the name.
@@ -33,13 +33,13 @@ elimination method, EISPACK's `ELMHES`), giving `Z = D·P·L` with `L` unit lowe
 ## Install
 
 ```julia
-using Pkg; Pkg.add("LHL")
+using Pkg; Pkg.add("LHLFactorization")
 ```
 
 ## Use
 
 ```julia
-using LHL, LinearAlgebra
+using LHLFactorization, LinearAlgebra
 
 J = randn(400, 400)
 b = randn(400)
@@ -56,14 +56,23 @@ end
 `lhl_shift!(ws, σ, τ)` loads `σI + τJ`. `(1, -γ)` gives `I - γJ`; `(0, 1)` gives `J`
 itself; `(-1/(dt*γ), 1)` gives the W-transform `J - I/(dt·γ)` an implicit ODE solver uses.
 
-`ShiftedJacobian(J, γ)` wraps the same idea as a lazy `AbstractMatrix` equal to `I - γJ`,
-for handing to a linear-solver interface:
+To drive this from a solver interface rather than by hand, LinearSolve.jl's
+`LHLFactorization` consumes a `SciMLOperators.WOperator` — the split `J - M/γ` an implicit
+ODE solver already builds — and moves the shift with `update_gamma!`.
 
 ```julia
-A = ShiftedJacobian(J, 0.01)      # indexes, multiplies and converts as I - 0.01J
-set_shift!(A, 0.013)              # now I - 0.013J
-mark_jacobian_updated!(A)         # announce that J's contents changed
+using LinearSolve, SciMLOperators
+W = WOperator{true}(I, 0.01, J, similar(b))
+cache = init(LinearProblem(W, b), LHLFactorization())
+u1 = solve!(cache).u
+update_gamma!(cache, 0.013)       # O(n²): reuses the reduction of J
+u2 = solve!(cache).u
 ```
+
+!!! note
+    A user loading both this package and LinearSolve.jl sees the module name
+    `LHLFactorization` shadow LinearSolve's algorithm type of the same name. Reach for
+    `LinearSolve.LHLFactorization` in that case; `using LinearSolve` alone is unambiguous.
 
 ## Who this is for
 

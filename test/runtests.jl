@@ -1,4 +1,4 @@
-using LHL, LinearAlgebra, Random, Test
+using LHLFactorization, LinearAlgebra, Random, Test
 
 bwd(W, x, b) = norm(b - W * x, Inf) / (opnorm(W, Inf) * norm(x, Inf) + norm(b, Inf))
 
@@ -69,28 +69,6 @@ end
     ws = lhl(J)
     lhl_shift!(ws, 1, -γ)
     @test lhl_ldiv!(copy(b), ws) ≈ Matrix(I - γ * J) \ b rtol = 1.0e-9
-end
-
-@testset "ShiftedJacobian behaves as the matrix it stands for" begin
-    for n in (1, 2, 3, 17)
-        J = randn(MersenneTwister(n), n, n)
-        x = randn(MersenneTwister(n + 1), n)
-        γ = 0.31
-        W = ShiftedJacobian(J, γ)
-        Wd = I - γ * J
-        @test size(W) == size(J)
-        @test Matrix(W) ≈ Wd
-        y = similar(x)
-        @test mul!(y, W, x) ≈ Wd * x
-        y .= 1
-        @test mul!(y, W, x, 2.0, 3.0) ≈ 2 * (Wd * x) .+ 3
-        @test Matrix(ShiftedJacobian(J, 2.0, -0.5)) ≈ 2 * J - 0.5I
-        @test Matrix(copy(W)) ≈ Wd
-        @test Matrix(set_shift!(W, 0.7)) ≈ I - 0.7 * J
-        v = W.jac_version
-        @test mark_jacobian_updated!(W).jac_version == v + 1
-        @test mark_jacobian_updated!(rand(2, 2)) isa Matrix    # no-op off the type
-    end
 end
 
 @testset "pivoting is what makes it work" begin

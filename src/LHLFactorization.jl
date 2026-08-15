@@ -1,5 +1,5 @@
 """
-    LHL
+    LHLFactorization
 
 The **LHL factorization**: a reduction of a square matrix to upper Hessenberg form by
 Gaussian similarity transformations with partial pivoting,
@@ -33,8 +33,9 @@ for γ in (0.01, 0.013, 0.02)
 end
 ```
 
-`ShiftedJacobian(J, γ)` wraps the same idea as an `AbstractMatrix` equal to `I - γJ`, for
-handing to a linear-solver interface. LinearSolve.jl's `LHLFactorization` does exactly that.
+To drive this from a linear-solver interface rather than by hand, LinearSolve.jl's
+`LHLFactorization` wraps it, and consumes `SciMLOperators.WOperator` — the split
+`J - M/γ` an implicit ODE solver already builds — as its system matrix.
 
 ## Stability
 
@@ -43,104 +44,13 @@ Partial pivoting is not optional (without it the method loses every digit on ord
 matrices), and one step of iterative refinement — see `lhl_refine!` — restores a backward
 error comparable to LU's even on the near-nilpotent matrices where `κ(Z)` reaches `10¹⁰`.
 """
-module LHL
+module LHLFactorization
 
 using LinearAlgebra
 using LinearAlgebra: BlasInt, checksquare
 
 export LHLWorkspace, lhl, lhl!, lhl_reduce!, lhl_shift!, lhl_ldiv!, lhl_refine!,
-    applyZ!, applyZinv!, ShiftedJacobian, mark_jacobian_updated!, set_shift!
-
-"""
-    ShiftedJacobian(J, γ)
-
-Lazy representation of `I - γ*J` as an `AbstractMatrix`: the "W matrix" of an implicit
-ODE/DAE solver, kept in the split form so that a solver can react to a change of `γ`
-without touching `J`.
-
-Indexing, `mul!`, `Matrix`, `\\` and everything else generic behave exactly as they would
-for the assembled `I - γ*J`, so a `ShiftedJacobian` may be handed to any LinearSolve
-algorithm.  LinearSolve.jl's `LHLFactorization` is the one that exploits the split: it
-factorizes `J` once and then absorbs a new `γ` in `O(n²)`.
-
-More generally a `ShiftedJacobian(J, α, β)` stands for `α*J + β*I`, which is the form an
-implicit ODE solver using the W-transform `W = J - M/(dt·γ)` needs.
-
-The shift is mutable — set it with [`set_shift!`](@ref) (or, through a LinearSolve cache,
-`update_gamma!`/`update_shift!`).  When the *contents* of `J` change, call
-[`mark_jacobian_updated!`](@ref) so that solvers caching a factorization of `J` know to
-rebuild it.
-
-!!! note
-    A general mass matrix is not supported: only `M = I`.  `M = μI` can be folded by
-    solving `I - (γ/μ)J` and scaling the right-hand side by `1/μ`.
-
-## Example
-
-```julia
-J = randn(200, 200)
-A = ShiftedJacobian(J, 0.01)          # == I - 0.01J
-@assert A ≈ I - 0.01J
-set_shift!(A, -0.013, 1)              # now == I - 0.013J
-```
-"""
-mutable struct ShiftedJacobian{T, JT <: AbstractMatrix} <: AbstractMatrix{T}
-    J::JT
-    α::T
-    β::T
-    jac_version::Int
-end
-
-ShiftedJacobian(J::AbstractMatrix, γ::Number) = ShiftedJacobian(J, -γ, oneunit(γ))
-
-function ShiftedJacobian(J::AbstractMatrix, α::Number, β::Number)
-    T = promote_type(eltype(J), typeof(α), typeof(β))
-    return ShiftedJacobian{T, typeof(J)}(J, convert(T, α), convert(T, β), 0)
-end
-
-Base.size(W::ShiftedJacobian) = size(W.J)
-Base.@propagate_inbounds function Base.getindex(
-        W::ShiftedJacobian{T}, i::Int, j::Int
-    ) where {T}
-    return W.α * W.J[i, j] + (i == j ? W.β : zero(T))
-end
-Base.copy(W::ShiftedJacobian) = ShiftedJacobian(copy(W.J), W.α, W.β, W.jac_version)
-
-# A lazy view of `α*J + β*I` has nowhere to put an element. Say so plainly: the default
-# `CanonicalIndexError` gives no hint about what to do instead, and the usual way to hit
-# this is handing a `ShiftedJacobian` to a solver that factorizes in place.
-@noinline function Base.setindex!(W::ShiftedJacobian, args...)
-    throw(
-        ArgumentError(
-            "a ShiftedJacobian is a lazy view of α*J + β*I and cannot be written to elementwise. Use `Matrix(W)` for an algorithm that factorizes in place, or an algorithm that consumes the split form (LinearSolve.jl's `LHLFactorization`)."
-        )
-    )
-end
-
-# Split by rank rather than using `AbstractVecOrMat`: stdlib has separate `mul!` methods
-# for the vector and matrix cases, so a single VecOrMat method is ambiguous with both.
-for XT in (:AbstractVector, :AbstractMatrix)
-    @eval function LinearAlgebra.mul!(
-            y::$XT, W::ShiftedJacobian, x::$XT, a::Number, b::Number
-        )
-        iszero(b) ? fill!(y, zero(eltype(y))) : rmul!(y, b)
-        mul!(y, W.J, x, a * W.α, true)
-        return y .+= (a * W.β) .* x
-    end
-end
-
-"""
-    mark_jacobian_updated!(A) -> A
-
-Tell `A` that the Jacobian it wraps has new contents, invalidating any cached
-factorization of it.  A no-op for anything that is not a [`ShiftedJacobian`](@ref), so it
-is safe to call unconditionally.
-"""
-mark_jacobian_updated!(A) = A
-function mark_jacobian_updated!(W::ShiftedJacobian)
-    W.jac_version += 1
-    return W
-end
+    applyZ!, applyZinv!
 
 """
     LHLWorkspace
@@ -481,19 +391,6 @@ function lhl_refine!(x::AbstractVector, A, b::AbstractVector, ws::LHLWorkspace, 
     return x
 end
 
-
-"""
-    set_shift!(W::ShiftedJacobian, α, β) -> W
-
-Set the wrapped shift so that `W == α*J + β*I`.  `set_shift!(W, γ)` is the `I - γ*J` form.
-"""
-function set_shift!(W::ShiftedJacobian, α::Number, β::Number)
-    T = eltype(W)
-    W.α = convert(T, α)
-    W.β = convert(T, β)
-    return W
-end
-set_shift!(W::ShiftedJacobian, γ::Number) = set_shift!(W, -γ, oneunit(γ))
 
 """
     lhl(J; balance = true) -> LHLWorkspace
