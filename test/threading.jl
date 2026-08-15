@@ -1,3 +1,7 @@
+using LHLFactorization, LinearAlgebra, Random, Test
+
+bwd(W, x, b) = norm(b - W * x, Inf) / (opnorm(W, Inf) * norm(x, Inf) + norm(b, Inf))
+
 # The threaded reduction partitions its work independently of the thread count, so the
 # threaded and serial paths must agree to the bit.  Without Polyester loaded, or with one
 # thread, the two paths coincide and this only checks the API (CI runs with four threads).
@@ -81,3 +85,9 @@ function threading_tests()
     end
     return nothing
 end
+
+# The threading testset runs twice: without Polyester (`thread = Val(true)` must then be
+# the serial path) and, after `using Polyester`, with the extension loaded.
+threading_tests()
+using Polyester
+threading_tests()

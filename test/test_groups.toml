@@ -1,3 +1,5 @@
+# Core = the top-level test/*.jl files: core_tests.jl and threading.jl (the latter runs
+# its testset twice, with and without the Polyester extension loaded).
 [Core]
 versions = ["lts", "1", "pre"]
 
