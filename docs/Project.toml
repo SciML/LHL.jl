@@ -1,0 +1,7 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+LHLFactorization = "2faa5264-e118-4071-8864-e10559f68c7c"
+
+[compat]
+Documenter = "1"
+LHLFactorization = "1"
