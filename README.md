@@ -82,8 +82,10 @@ Anything that solves the same matrix shifted many ways:
   step-size control moves `γ` every step while `J` is held fixed for tens of them, so the
   conventional solver pays `O(n³)` per step to absorb a scalar. Via LinearSolve.jl's
   `LHLFactorization` this is a drop-in change; on a dense 800-unknown Brusselator it is
-  2.6–3.7× faster end to end at matched accuracy.
-- **Resolvents and transfer functions**, `(sI - A)⁻¹` swept over `s`.
+  2.6–3.7× faster end to end at matched accuracy. Radau methods, whose stages split into a
+  real and a complex shift of the same `J`, hold both against one reduction.
+- **Resolvents and transfer functions**, `(sI - A)⁻¹` swept over `s` — complex `s` on a real
+  `A` keeps the reduction real (see *Complex shifts on a real matrix*).
 - **Shift-and-invert eigenvalue iterations** with a moving shift.
 
 It is *not* a general-purpose `Ax = b` solver. Against a single system an LU wins on every
@@ -145,10 +147,66 @@ upper Hessenberg matrix has one subdiagonal, so each elimination step chooses be
 candidates and the growth factor of the Hessenberg LU is bounded by `n`, against `2ⁿ⁻¹` for
 general partial pivoting. The whole exposure sits in `Z`.
 
+## Complex shifts on a real matrix
+
+Two consumers want a real `J` with complex shifts: resolvents and transfer functions
+`(sI - A)⁻¹` swept over complex `s`, and Radau-type implicit Runge–Kutta methods, whose
+stage system splits into a real `(I - γhJ)` and a complex `(I - (α + βi)hJ)` against the
+same Jacobian. Promoting `J` to complex would make the `O(n³)` reduction complex — about
+6–7× the flops of the real one — and every solve a fully complex one. Instead the reduction
+stays real and only the shifted half is complex:
+
+```julia
+ws = lhl(J; shift = ComplexF64)      # real reduction, complex shifts (also lhl! on it)
+for s in svals                       # resolvent sweep
+    lhl_shift!(ws, s, -1)            # loads sI - J
+    x = lhl_ldiv!(copy(b), ws)       # b, x complex
+end
+```
+
+The `shift` type is `eltype(J)` or `Complex{eltype(J)}`; a complex shift on a workspace built
+for real ones throws an `ArgumentError`, as does a real `x` for a complex solve. To hold several
+shifts against one reduction at once — the Radau case — build extra shift states and pass them
+explicitly; the workspace's own `ws.shift` is what the two-argument forms use:
+
+```julia
+ws = lhl(J)                          # real reduction, real ws.shift
+sh = LHLShift{ComplexF64}(ws)        # a second, complex shift state on the same reduction
+lhl_shift!(ws, 1, -γ * h)            # (I - γhJ)
+lhl_shift!(sh, ws, 1, -(α + β * im) * h)
+x1 = lhl_ldiv!(copy(b1), ws)         # real
+x2 = lhl_ldiv!(copy(b2), sh, ws)     # complex
+lhl_refine!(x2, I - (α + β * im) * h * J, b2, sh, ws, 1)   # optional
+```
+
+`lhl!(ws, J)` re-reduces; a held `LHLShift` follows the workspace's size on its next
+`lhl_shift!`. Internally the complex `Gt` and the solve buffers are stored *planar* (real and
+imaginary parts in separate rows), so the `Z` sweeps run the real multipliers over both planes
+in one pass and every complex product is four real multiply–adds with no lane shuffling.
+
+Measured on one thread (Float64, Julia 1.10, µs; `rc` = real reduction with a complex shift,
+`rr` = real shift, `cc` = fully complex workspace on the same `J`):
+
+| n | shift rr / rc / cc | solve rr / rc / cc | reduction real / complex |
+|---|---|---|---|
+| 16 | 0.28 / 1.21 / 1.26 | 0.25 / 0.44 / 0.71 | 2.2 / 7.9 |
+| 64 | 1.5 / 6.1 / 7.3 | 1.2 / 2.5 / 5.5 | 44 / 287 |
+| 256 | 16 / 41 / 52 | 15 / 28 / 70 | 2 180 / 13 940 |
+| 1024 | 214 / 549 / 860 | 255 / 525 / 1 257 | 112 000 / 818 000 |
+
+A complex shift costs 2.5–4.5× a real one (its `Gt` is twice the bytes) and its solve 1.8–2.1×
+a real solve — the arithmetic ratio of complex-on-real work — where the fully complex workspace
+pays 3–5× on the shift, 2.9–4.9× on the solve and 3.6–7.3× on the reduction, whose real form is
+the part that is saved. Float32 ratios are lower still (shift 2.1–3×, solve 1.5–2×); Julia 1.12
+matches 1.10 within a few percent on the shift and the solve. The real reduction's pivots are
+real, and its forward error is within a factor of a few of the complex reduction's on the same
+problem.
+
 ## Limits
 
 - Dense matrices only — the reduction fills in, so sparsity buys nothing.
-- Real or complex `AbstractMatrix` with a scalar element type.
+- Real or complex `AbstractMatrix` with a scalar element type; shifts of the matrix's element
+  type or its complex extension (`Complex{Float32}` shifts on a `Float64` matrix, say, are not).
 - No generalized (pencil) form: `M - γJ` for a general mass matrix `M` would need a
   Hessenberg–triangular reduction, which is not implemented. `M = μI` folds into the shift.
 

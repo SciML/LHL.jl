@@ -19,6 +19,9 @@ for many `(σ, τ)` against one reduction.  The shift never reaches `Z`, so
 and `σI + τH` is Hessenberg: a new shift costs `O(n²)`, against `O(n³)` for a fresh LU.
 The motivating case is the iteration matrix `W = I - γJ` of a stiff ODE solver, where
 adaptive step-size control changes `γ` every step while `J` is held fixed for tens of them.
+A real `J` may take complex shifts — resolvents `(sI - J)⁻¹`, the complex stage systems of
+Radau methods — while its reduction stays real: `lhl(J; shift = ComplexF64)`, or an
+[`LHLShift`](@ref) held next to the workspace.
 
 ## Example
 
@@ -49,14 +52,77 @@ module LHLFactorization
 using LinearAlgebra
 using LinearAlgebra: BlasInt, checksquare
 
-export LHLWorkspace, lhl, lhl!, lhl_reduce!, lhl_shift!, lhl_ldiv!, lhl_refine!,
+export LHLWorkspace, LHLShift, lhl, lhl!, lhl_reduce!, lhl_shift!, lhl_ldiv!, lhl_refine!,
     applyZ!, applyZinv!
 
 """
-    LHLWorkspace
+    LHLShift{TG}(n)
+    LHLShift{TG}(ws::LHLWorkspace)
 
-Storage for one LHL factorization: the reduction of `J` and the LU of the current shifted
-Hessenberg.  Build one with [`lhl`](@ref) or [`lhl!`](@ref).
+The shift-dependent half of an LHL solve: the LU of one `σI + τH` and the buffers its
+solves need, with element type `TG`.  Every [`LHLWorkspace`](@ref) owns one (`ws.shift`),
+which the two-argument `lhl_shift!(ws, σ, τ)` / `lhl_ldiv!(x, ws)` use; build more to hold
+several shifts against one reduction at once — a real one and a complex one on the same
+real `J`, as a Radau-type implicit Runge–Kutta step needs — and pass them explicitly:
+`lhl_shift!(sh, ws, σ, τ)`, `lhl_ldiv!(x, sh, ws)`.  `TG` is the reduction's element type
+`T` or `Complex{T}`.
+
+`Gt` holds the LU of `σI + τH` **transposed**: the Hessenberg elimination sweeps rows, and
+in a column-major array the transposed layout turns every inner loop of the per-shift work
+(fused rebuild and elimination, back substitution) into a contiguous one; it has extra zero
+rows below row `n` so the back substitution's dot products run to a full vector.  For a
+complex `TG` the storage is real and **planar**: each column of `Gt` holds the real parts in
+rows `1:n` and the imaginary parts in rows `po+1:po+n` (`po` the plane offset), and `work`
+and `xbuf` are laid out the same way, so that every inner loop is a real one — the Z sweeps
+run the real multipliers over each plane, and the complex products of the elimination and
+the back substitution are four real multiply–adds with no lane shuffling.  `rdiag` holds
+the reciprocals of the pivots, `swap` the interchanges, `info` the index of the first zero
+pivot (0 if none), `σ`/`τ` the shift loaded.  `work` is the pending row of `lhl_shift!`,
+`resid` the residual of `lhl_refine!`, `xbuf` the padded copy of the right-hand side the
+solves work in — so one `LHLShift` must not serve concurrent solves.
+"""
+mutable struct LHLShift{TG, Tr}
+    Gt::Matrix{Tr}
+    rdiag::Vector{TG}
+    swap::Vector{Bool}
+    work::Vector{Tr}
+    resid::Vector{TG}
+    xbuf::Vector{Tr}
+    σ::TG
+    τ::TG
+    n::Int
+    po::Int
+    info::Int
+end
+
+# Rows per plane: `n` plus the vector pad; for two planes, kept a safe distance from a
+# multiple of 4 KiB so the real and imaginary planes of one column do not alias in L1.
+_lhl_planes(::Type{TG}) where {TG} = TG <: Complex ? 2 : 1
+function _lhl_planeoff(n::Int, ::Type{TG}) where {TG}
+    Tr = real(TG)
+    m = n + _lhl_tilew(Tr)
+    return TG <: Complex ? _lhl_ld(m, Tr) : m
+end
+
+function LHLShift{TG}(n::Integer) where {TG}
+    Tr = real(TG)
+    P = _lhl_planes(TG)
+    po = _lhl_planeoff(n, TG)
+    return LHLShift{TG, Tr}(
+        zeros(Tr, P * po, n), Vector{TG}(undef, n), Vector{Bool}(undef, n),
+        Vector{Tr}(undef, P * po), Vector{TG}(undef, n), zeros(Tr, P * po),
+        zero(TG), zero(TG), n, po, 0
+    )
+end
+
+"""
+    LHLWorkspace{T}(n; shift = T)
+
+Storage for one LHL factorization: the reduction of `J` (element type `T`) and, in
+`ws.shift::LHLShift{shift}`, the LU of the current shifted Hessenberg.  Build one with
+[`lhl`](@ref) or [`lhl!`](@ref).  `shift = Complex{T}` on a real `T` gives a real reduction
+whose shifts and solves are complex — see [`LHLShift`](@ref); `T` and `Complex{real(T)}`
+are the two choices.  (`LHLWorkspace{T, Tr, TG}`: `Tr = real(T)`, `TG` the shift type.)
 
 `factors` holds `H` in `triu(factors, -1)` and the step-`k` multipliers in the annihilated
 positions `factors[k+2:n, k]`, exactly the way an LU packs its own; `Lp` holds the same
@@ -64,22 +130,18 @@ multipliers repacked for the solves (see `_lhl_lpack!`: groups of four columns i
 in `W`-row tiles, zero padded, so that a rank-4 sweep reads one contiguous stream with no
 remainder loop).  `perm`/`iperm` are the pivot permutation `P` and its inverse, `iscale`
 the reciprocals of the balancing `scale` (powers of two, so exact), and `xbuf` a padded
-copy of the right-hand side the solves work in.  `Ht` and `Gt` hold
-`H` and the LU of `I - γH` **transposed**: the Hessenberg elimination sweeps rows, and in
-a column-major array the transposed layout turns every inner loop of the per-γ work
-(fused rebuild and elimination, back substitution) into a contiguous one; `Gt` has `W`
-extra zero rows below row `n` so the back substitution's dot products run to a full
-vector.  `rdiag` holds the reciprocals of the pivots of that LU.  `resid` doubles
-as scratch for the reduction and for `lhl_shift!`; `Ht` and `Gt` are scratch during the
-reduction, which fills `Ht` last.  `factors` is an `n×n` view into `fstore`, whose leading
-dimension is padded so that no small multiple of the column stride falls within a vector of
-a multiple of 4 KiB (the reduction's row-block sweep would otherwise stall on loads that
+copy of the vector `applyZ!`/`applyZinv!` work in.  `Ht` holds `H` **transposed** (see
+[`LHLShift`](@ref) for why); `Ht`, `work` and `pack` are scratch during the reduction,
+which fills `Ht` last.  `factors` is an `n×n` view into `fstore`, whose leading dimension
+is padded so that no small multiple of the column stride falls within a vector of a
+multiple of 4 KiB (the reduction's row-block sweep would otherwise stall on loads that
 alias its own stores a few columns back).
 
-The solves write `xbuf` (and `lhl_refine!` `resid`), so one workspace must not serve
-concurrent solves; give each thread its own.
+The fields of `ws.shift` (`Gt`, `rdiag`, `swap`, `resid`, `σ`, `τ`, `info`) are also
+reachable as properties of `ws`.  The solves write `xbuf` (and `lhl_refine!` `resid`), so
+one workspace must not serve concurrent solves; give each thread its own.
 """
-mutable struct LHLWorkspace{T, Tr}
+mutable struct LHLWorkspace{T, Tr, TG}
     fstore::Matrix{T}
     factors::SubArray{T, 2, Matrix{T}, Tuple{UnitRange{Int}, UnitRange{Int}}, false}
     Lp::Vector{T}
@@ -89,31 +151,44 @@ mutable struct LHLWorkspace{T, Tr}
     scale::Vector{Tr}
     iscale::Vector{Tr}
     Ht::Matrix{T}
-    Gt::Matrix{T}
-    rdiag::Vector{T}
-    swap::Vector{Bool}
-    resid::Vector{T}
+    work::Vector{T}
+    pack::Vector{T}
     xbuf::Vector{T}
-    σ::T
-    τ::T
+    shift::LHLShift{TG, Tr}
     # Whether `factors` holds a valid reduction. A consumer tracking *whose* Jacobian it
     # is must do so itself; this only says one was computed.
     reduced::Bool
     n::Int
-    info::Int
 end
 
-function LHLWorkspace{T}(n::Integer) where {T}
+function LHLWorkspace{T}(n::Integer; shift::Type = T) where {T}
+    TG = shift
     Tr = real(T)
+    (TG === T || TG === Complex{Tr}) || throw(
+        ArgumentError("shift type must be $T or $(Complex{Tr}), got $TG")
+    )
     W = _lhl_tilew(T)
     F = Matrix{T}(undef, _lhl_ld(n, T), n)
-    return LHLWorkspace{T, Tr}(
+    return LHLWorkspace{T, Tr, TG}(
         F, view(F, 1:n, 1:n), Vector{T}(undef, _lhl_lpack_len(n, W)),
         Vector{Int}(undef, max(n - 2, 0)), collect(1:n), collect(1:n), ones(Tr, n), ones(Tr, n),
-        Matrix{T}(undef, n, n), zeros(T, n + W, n), Vector{T}(undef, n),
-        Vector{Bool}(undef, n), Vector{T}(undef, n), zeros(T, n + W), zero(T), zero(T), false, n, 0
+        Matrix{T}(undef, n, n), Vector{T}(undef, n), Vector{T}(undef, _lhl_pack_len(n)),
+        zeros(T, n + W), LHLShift{TG}(n), false, n
     )
 end
+
+LHLShift{TG}(ws::LHLWorkspace) where {TG} = LHLShift{TG}(ws.n)
+
+const _LHL_SHIFT_FIELDS = (:Gt, :rdiag, :swap, :resid, :σ, :τ, :info)
+@inline function Base.getproperty(ws::LHLWorkspace, s::Symbol)
+    s in _LHL_SHIFT_FIELDS && return getfield(getfield(ws, :shift), s)
+    return getfield(ws, s)
+end
+@inline function Base.setproperty!(ws::LHLWorkspace, s::Symbol, v)
+    s in _LHL_SHIFT_FIELDS && return setfield!(getfield(ws, :shift), s, v)
+    return setfield!(ws, s, v)
+end
+Base.propertynames(::LHLWorkspace) = (fieldnames(LHLWorkspace)..., _LHL_SHIFT_FIELDS...)
 
 # Rows per tile of the packed multipliers and of the buffer padding: one vector register
 # for the explicit kernels, a fixed 8 for the generic sweeps.
@@ -165,26 +240,45 @@ function _lhl_ld(n::Int, ::Type{T}) where {T}
     return ld
 end
 
+# Scratch for the blocked reduction's packed GEMM/TRSM operands (`_lhl_gemm_micro!`,
+# `_lhl_trsm_block!`).
+_lhl_pack_len(n::Int) = (nb = _lhl_panel_width(n); nb * (n + 4) + nb * nb)
+
 function _lhl_resize!(ws::LHLWorkspace{T}, n::Int) where {T}
     n == ws.n && size(ws.factors, 1) == n && return ws
     W = _lhl_tilew(T)
     ws.fstore = Matrix{T}(undef, _lhl_ld(n, T), n)
     ws.factors = view(ws.fstore, 1:n, 1:n)
     ws.Ht = Matrix{T}(undef, n, n)
-    ws.Gt = zeros(T, n + W, n)
     resize!(ws.Lp, _lhl_lpack_len(n, W))
     resize!(ws.ipiv, max(n - 2, 0))
     resize!(ws.perm, n)
     resize!(ws.iperm, n)
     resize!(ws.scale, n)
     resize!(ws.iscale, n)
-    resize!(ws.rdiag, n)
-    resize!(ws.swap, n)
-    resize!(ws.resid, n)
+    resize!(ws.work, n)
+    resize!(ws.pack, _lhl_pack_len(n))
     resize!(ws.xbuf, n + W)
+    _lhl_resize!(ws.shift, n)
     ws.n = n
     ws.reduced = false
     return ws
+end
+
+function _lhl_resize!(sh::LHLShift{TG, Tr}, n::Int) where {TG, Tr}
+    n == sh.n && return sh
+    P = _lhl_planes(TG)
+    po = _lhl_planeoff(n, TG)
+    sh.Gt = zeros(Tr, P * po, n)
+    resize!(sh.rdiag, n)
+    resize!(sh.swap, n)
+    resize!(sh.work, P * po)
+    resize!(sh.resid, n)
+    resize!(sh.xbuf, P * po)
+    sh.n = n
+    sh.po = po
+    sh.info = 0
+    return sh
 end
 
 # ---------------------------------------------------------------------------
@@ -267,12 +361,7 @@ function lhl_reduce!(ws::LHLWorkspace{T}, J::AbstractMatrix, balance::Bool) wher
         fill!(ws.iscale, one(eltype(ws.iscale)))
     end
     if n >= _lhl_block_min(T)
-        _lhl_reduce_blocked!(A, ws.ipiv, ws.Ht, ws.resid, ws.Gt, _lhl_panel_width(n))
-        # Gt was scratch; the solves need its pad rows zero again.
-        Gt = ws.Gt
-        @inbounds for j in 1:n, i in (n + 1):size(Gt, 1)
-            Gt[i, j] = zero(T)
-        end
+        _lhl_reduce_blocked!(A, ws.ipiv, ws.Ht, ws.work, ws.pack, _lhl_panel_width(n))
     else
         _lhl_reduce_unblocked!(A, ws.ipiv)
     end
@@ -459,6 +548,8 @@ function _lhl_trailing_update!(A::StridedMatrix{T}, k::Int, n::Int) where {T <: 
     return A
 end
 
+@inline _lhl_vneg(a::V) where {W, T, V <: NTuple{W, VecElement{T}}} =
+    ntuple(w -> VecElement(-a[w].value), Val(W))
 @inline _lhl_vadd(a::V, b::V) where {W, T, V <: NTuple{W, VecElement{T}}} =
     ntuple(w -> VecElement(a[w].value + b[w].value), Val(W))
 @inline _lhl_vselect(m::NTuple{W, Bool}, a::V, b::V) where {W, T, V <: NTuple{W, VecElement{T}}} =
@@ -1092,7 +1183,7 @@ function applyZ!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
             y[i] = x[i]
         end
         _lhl_zero_pad!(y, n)
-        _lhl_zsweep_buf!(y, ws.Lp, n)
+        _lhl_zsweep_buf!(y, 0, ws.Lp, n)
         d = ws.scale
         ip = ws.iperm
         @inbounds for i in 1:n
@@ -1124,7 +1215,7 @@ function applyZinv!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
     if eltype(x) === T
         y = ws.xbuf
         _lhl_gather!(y, x, ws)
-        _lhl_zinvsweep_buf!(y, ws.Lp, n)
+        _lhl_zinvsweep_buf!(y, 0, ws.Lp, n)
         @inbounds for i in 1:n
             x[i] = y[i]
         end
@@ -1260,120 +1351,194 @@ function _lhl_zsweep!(x::AbstractVector, Lp::AbstractVector{T}, n::Int) where {T
 end
 
 # The same sweeps on the padded buffer `ws.xbuf` (length ≥ n + W, zero past n): every tile
-# is a full vector, so there is no remainder loop and no branch on the row count.
-_lhl_zinvsweep_buf!(y::AbstractVector, Lp::AbstractVector, n::Int) = _lhl_zinvsweep!(y, Lp, n)
-_lhl_zsweep_buf!(y::AbstractVector, Lp::AbstractVector, n::Int) = _lhl_zsweep!(y, Lp, n)
-
-function _lhl_zinvsweep_buf!(y::Vector{T}, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
-    sz = sizeof(T)
-    tiled = _lhl_tiled(n, T)
-    G = max(n - 2, 0) >> 2
-    GC.@preserve y Lp begin
-        py = pointer(y)
-        h = pointer(Lp)
-        @inbounds for g in 1:G
-            k = 4g - 3
-            x1 = y[k + 1]
-            x2 = muladd(-unsafe_load(h), x1, y[k + 2])
-            y[k + 2] = x2
-            x3 = muladd(-unsafe_load(h, 3), x2, muladd(-unsafe_load(h, 2), x1, y[k + 3]))
-            y[k + 3] = x3
-            x4 = muladd(-unsafe_load(h, 6), x3, muladd(-unsafe_load(h, 5), x2, muladd(-unsafe_load(h, 4), x1, y[k + 4])))
-            y[k + 4] = x4
-            b1 = _lhl_bcast(V, -x1)
-            b2 = _lhl_bcast(V, -x2)
-            b3 = _lhl_bcast(V, -x3)
-            b4 = _lhl_bcast(V, -x4)
-            p = h + _LHL_HEAD * sz
-            q = py + (k + 4) * sz
-            mpb = cld(n - k - 4, W) * W * sz
-            h = p + 4mpb
-            # byte distance between the four columns' rows, and the advance per vector
-            cs = tiled ? W * sz : mpb
-            pa = tiled ? 4W * sz : W * sz
-            pend = tiled ? h : p + mpb
-            while p < pend
-                v = _lhl_vload(V, q)
-                v = _lhl_fma(_lhl_vload(V, p), b1, v)
-                v = _lhl_fma(_lhl_vload(V, p + cs), b2, v)
-                v = _lhl_fma(_lhl_vload(V, p + 2cs), b3, v)
-                v = _lhl_fma(_lhl_vload(V, p + 3cs), b4, v)
-                _lhl_vstore!(q, v)
-                p += pa
-                q += W * sz
-            end
-        end
-        @inbounds for k in (4G + 1):(n - 2)
-            b = _lhl_bcast(V, -y[k + 1])
-            q = py + (k + 1) * sz
-            pend = h + cld(n - k - 1, W) * W * sz
-            while h < pend
-                _lhl_vstore!(q, _lhl_fma(_lhl_vload(V, h), b, _lhl_vload(V, q)))
-                h += W * sz
-                q += W * sz
-            end
-        end
-    end
-    return y
+# is a full vector, so there is no remainder loop and no branch on the row count.  `o` is
+# the offset of the vector inside `y` (a plane of a complex buffer); the two-plane forms
+# sweep the planes at `oa` and `ob` together, reading each multiplier once.
+_lhl_zinvsweep_buf!(y::AbstractVector, o::Int, Lp::AbstractVector, n::Int) =
+    _lhl_zinvsweep!(view(y, (o + 1):length(y)), Lp, n)
+_lhl_zsweep_buf!(y::AbstractVector, o::Int, Lp::AbstractVector, n::Int) =
+    _lhl_zsweep!(view(y, (o + 1):length(y)), Lp, n)
+function _lhl_zinvsweep_buf!(y::AbstractVector, oa::Int, ob::Int, Lp::AbstractVector, n::Int)
+    _lhl_zinvsweep_buf!(y, oa, Lp, n)
+    return _lhl_zinvsweep_buf!(y, ob, Lp, n)
+end
+function _lhl_zsweep_buf!(y::AbstractVector, oa::Int, ob::Int, Lp::AbstractVector, n::Int)
+    _lhl_zsweep_buf!(y, oa, Lp, n)
+    return _lhl_zsweep_buf!(y, ob, Lp, n)
 end
 
-function _lhl_zsweep_buf!(y::Vector{T}, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
-    V = _lhl_vectype(T)
-    W = _LHL_VEC_BYTES ÷ sizeof(T)
-    sz = sizeof(T)
-    tiled = _lhl_tiled(n, T)
-    G = max(n - 2, 0) >> 2
-    GC.@preserve y Lp begin
-        py = pointer(y)
-        h = pointer(Lp) + length(Lp) * sz
-        @inbounds for k in (n - 2):-1:(4G + 1)
-            b = _lhl_bcast(V, y[k + 1])
-            m = cld(n - k - 1, W) * W
-            h -= m * sz
-            p = h
-            q = py + (k + 1) * sz
-            pend = p + m * sz
-            while p < pend
-                _lhl_vstore!(q, _lhl_fma(_lhl_vload(V, p), b, _lhl_vload(V, q)))
-                p += W * sz
-                q += W * sz
+# The head of a group of four steps (its 3×3 triangle, `h` pointing at the eight head
+# slots): the serial recurrence on rows k+1:k+4 of the plane at `o`, returning the four
+# values the body broadcasts.
+@inline function _lhl_zinv_head!(y::Vector{T}, o::Int, k::Int, h::Ptr{T}) where {T}
+    @inbounds begin
+        x1 = y[o + k + 1]
+        x2 = muladd(-unsafe_load(h), x1, y[o + k + 2])
+        y[o + k + 2] = x2
+        x3 = muladd(-unsafe_load(h, 3), x2, muladd(-unsafe_load(h, 2), x1, y[o + k + 3]))
+        y[o + k + 3] = x3
+        x4 = muladd(-unsafe_load(h, 6), x3, muladd(-unsafe_load(h, 5), x2, muladd(-unsafe_load(h, 4), x1, y[o + k + 4])))
+        y[o + k + 4] = x4
+    end
+    return x1, x2, x3, x4
+end
+@inline function _lhl_z_head!(y::Vector{T}, o::Int, k::Int, h::Ptr{T}) where {T}
+    @inbounds begin
+        x1 = y[o + k + 1]
+        x2 = y[o + k + 2]
+        x3 = y[o + k + 3]
+        x4 = y[o + k + 4]
+        y[o + k + 2] = muladd(unsafe_load(h), x1, x2)
+        y[o + k + 3] = muladd(unsafe_load(h, 3), x2, muladd(unsafe_load(h, 2), x1, x3))
+        y[o + k + 4] = muladd(unsafe_load(h, 6), x3, muladd(unsafe_load(h, 5), x2, muladd(unsafe_load(h, 4), x1, x4)))
+    end
+    return x1, x2, x3, x4
+end
+@inline _lhl_bcast4(::Type{V}, x) where {V} =
+    (_lhl_bcast(V, x[1]), _lhl_bcast(V, x[2]), _lhl_bcast(V, x[3]), _lhl_bcast(V, x[4]))
+@inline _lhl_neg4(x) = (-x[1], -x[2], -x[3], -x[4])
+
+# The body of a group: rows k+5:n of the four columns against the broadcasts `b`, one plane
+# (`q`) or two (`q` and `q + od`).  `p` walks the multipliers, `pa` per vector, `cs` between
+# the four columns' rows.
+@inline function _lhl_zbody!(::Type{V}, p::Ptr{T}, pend::Ptr{T}, pa::Int, cs::Int, q::Ptr{T}, b) where {W, T, V <: NTuple{W, VecElement{T}}}
+    while p < pend
+        v = _lhl_vload(V, q)
+        v = _lhl_fma(_lhl_vload(V, p), b[1], v)
+        v = _lhl_fma(_lhl_vload(V, p + cs), b[2], v)
+        v = _lhl_fma(_lhl_vload(V, p + 2cs), b[3], v)
+        v = _lhl_fma(_lhl_vload(V, p + 3cs), b[4], v)
+        _lhl_vstore!(q, v)
+        p += pa
+        q += W * sizeof(T)
+    end
+    return nothing
+end
+@inline function _lhl_zbody!(::Type{V}, p::Ptr{T}, pend::Ptr{T}, pa::Int, cs::Int, q::Ptr{T}, od::Int, b, c) where {W, T, V <: NTuple{W, VecElement{T}}}
+    while p < pend
+        v = _lhl_vload(V, q)
+        w = _lhl_vload(V, q + od)
+        l = _lhl_vload(V, p)
+        v = _lhl_fma(l, b[1], v)
+        w = _lhl_fma(l, c[1], w)
+        l = _lhl_vload(V, p + cs)
+        v = _lhl_fma(l, b[2], v)
+        w = _lhl_fma(l, c[2], w)
+        l = _lhl_vload(V, p + 2cs)
+        v = _lhl_fma(l, b[3], v)
+        w = _lhl_fma(l, c[3], w)
+        l = _lhl_vload(V, p + 3cs)
+        v = _lhl_fma(l, b[4], v)
+        w = _lhl_fma(l, c[4], w)
+        _lhl_vstore!(q, v)
+        _lhl_vstore!(q + od, w)
+        p += pa
+        q += W * sizeof(T)
+    end
+    return nothing
+end
+# A single step (rows k+2:n of one column) on one or two planes.
+@inline function _lhl_zstep!(::Type{V}, p::Ptr{T}, pend::Ptr{T}, q::Ptr{T}, b::V) where {W, T, V <: NTuple{W, VecElement{T}}}
+    while p < pend
+        _lhl_vstore!(q, _lhl_fma(_lhl_vload(V, p), b, _lhl_vload(V, q)))
+        p += W * sizeof(T)
+        q += W * sizeof(T)
+    end
+    return nothing
+end
+@inline function _lhl_zstep!(::Type{V}, p::Ptr{T}, pend::Ptr{T}, q::Ptr{T}, od::Int, b::V, c::V) where {W, T, V <: NTuple{W, VecElement{T}}}
+    while p < pend
+        l = _lhl_vload(V, p)
+        _lhl_vstore!(q, _lhl_fma(l, b, _lhl_vload(V, q)))
+        _lhl_vstore!(q + od, _lhl_fma(l, c, _lhl_vload(V, q + od)))
+        p += W * sizeof(T)
+        q += W * sizeof(T)
+    end
+    return nothing
+end
+
+for P in (1, 2)
+    # plane offsets and the per-plane head/broadcast statements
+    os = P == 1 ? (:o,) : (:oa, :ob)
+    args = [:($(o)::Int) for o in os]
+    heads(f) = Expr(:block, [:($(Symbol(:x, i)) = $f(y, $(os[i]), k, h)) for i in 1:P]...)
+    bcs(neg) = Expr(:block, [:($(Symbol(:b, i)) = _lhl_bcast4(V, $(neg ? :(_lhl_neg4($(Symbol(:x, i)))) : Symbol(:x, i)))) for i in 1:P]...)
+    bc1(neg) = Expr(:block, [:($(Symbol(:b, i)) = _lhl_bcast(V, $(neg ? :(-y[$(os[i]) + k + 1]) : :(y[$(os[i]) + k + 1])))) for i in 1:P]...)
+    body = P == 1 ? :(_lhl_zbody!(V, p, pend, pa, cs, q, b1)) : :(_lhl_zbody!(V, p, pend, pa, cs, q, od, b1, b2))
+    step = P == 1 ? :(_lhl_zstep!(V, h, pend, q, b1)) : :(_lhl_zstep!(V, h, pend, q, od, b1, b2))
+    od = P == 1 ? :(nothing) : :(od = (ob - oa) * sz)
+    o1 = os[1]
+    @eval begin
+        function _lhl_zinvsweep_buf!(y::Vector{T}, $(args...), Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
+            V = _lhl_vectype(T)
+            W = _LHL_VEC_BYTES ÷ sizeof(T)
+            sz = sizeof(T)
+            tiled = _lhl_tiled(n, T)
+            G = max(n - 2, 0) >> 2
+            $od
+            GC.@preserve y Lp begin
+                py = pointer(y) + $o1 * sz
+                h = pointer(Lp)
+                @inbounds for g in 1:G
+                    k = 4g - 3
+                    $(heads(:_lhl_zinv_head!))
+                    $(bcs(true))
+                    p = h + _LHL_HEAD * sz
+                    q = py + (k + 4) * sz
+                    mpb = cld(n - k - 4, W) * W * sz
+                    h = p + 4mpb
+                    # byte distance between the four columns' rows, and the advance per vector
+                    cs = tiled ? W * sz : mpb
+                    pa = tiled ? 4W * sz : W * sz
+                    pend = tiled ? h : p + mpb
+                    $body
+                end
+                @inbounds for k in (4G + 1):(n - 2)
+                    $(bc1(true))
+                    q = py + (k + 1) * sz
+                    pend = h + cld(n - k - 1, W) * W * sz
+                    $step
+                    h = pend
+                end
             end
+            return y
         end
-        @inbounds for g in G:-1:1
-            k = 4g - 3
-            h -= _lhl_group_size(n, k, W) * sz
-            x1 = y[k + 1]
-            x2 = y[k + 2]
-            x3 = y[k + 3]
-            x4 = y[k + 4]
-            y[k + 2] = muladd(unsafe_load(h), x1, x2)
-            y[k + 3] = muladd(unsafe_load(h, 3), x2, muladd(unsafe_load(h, 2), x1, x3))
-            y[k + 4] = muladd(unsafe_load(h, 6), x3, muladd(unsafe_load(h, 5), x2, muladd(unsafe_load(h, 4), x1, x4)))
-            b1 = _lhl_bcast(V, x1)
-            b2 = _lhl_bcast(V, x2)
-            b3 = _lhl_bcast(V, x3)
-            b4 = _lhl_bcast(V, x4)
-            p = h + _LHL_HEAD * sz
-            q = py + (k + 4) * sz
-            mpb = cld(n - k - 4, W) * W * sz
-            cs = tiled ? W * sz : mpb
-            pa = tiled ? 4W * sz : W * sz
-            pend = tiled ? p + 4mpb : p + mpb
-            while p < pend
-                v = _lhl_vload(V, q)
-                v = _lhl_fma(_lhl_vload(V, p), b1, v)
-                v = _lhl_fma(_lhl_vload(V, p + cs), b2, v)
-                v = _lhl_fma(_lhl_vload(V, p + 2cs), b3, v)
-                v = _lhl_fma(_lhl_vload(V, p + 3cs), b4, v)
-                _lhl_vstore!(q, v)
-                p += pa
-                q += W * sz
+
+        function _lhl_zsweep_buf!(y::Vector{T}, $(args...), Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
+            V = _lhl_vectype(T)
+            W = _LHL_VEC_BYTES ÷ sizeof(T)
+            sz = sizeof(T)
+            tiled = _lhl_tiled(n, T)
+            G = max(n - 2, 0) >> 2
+            $od
+            GC.@preserve y Lp begin
+                py = pointer(y) + $o1 * sz
+                h = pointer(Lp) + length(Lp) * sz
+                @inbounds for k in (n - 2):-1:(4G + 1)
+                    $(bc1(false))
+                    m = cld(n - k - 1, W) * W
+                    h -= m * sz
+                    q = py + (k + 1) * sz
+                    pend = h + m * sz
+                    $step
+                end
+                @inbounds for g in G:-1:1
+                    k = 4g - 3
+                    h -= _lhl_group_size(n, k, W) * sz
+                    $(heads(:_lhl_z_head!))
+                    $(bcs(false))
+                    p = h + _LHL_HEAD * sz
+                    q = py + (k + 4) * sz
+                    mpb = cld(n - k - 4, W) * W * sz
+                    cs = tiled ? W * sz : mpb
+                    pa = tiled ? 4W * sz : W * sz
+                    pend = tiled ? p + 4mpb : p + mpb
+                    $body
+                end
             end
+            return y
         end
     end
-    return y
 end
 
 # ---------------------------------------------------------------------------
@@ -1382,88 +1547,155 @@ end
 
 """
     lhl_shift!(ws, σ, τ) -> ws
+    lhl_shift!(sh::LHLShift, ws, σ, τ) -> sh
 
-Form `G = σI + τH` and LU-factorize it (partial pivoting) into `ws.Gt`, transposed.
-`≈n²` multiply–adds.  `(σ, τ) = (1, -γ)` gives `I - γJ`; `(0, 1)` gives `J` itself.
+Form `G = σI + τH` and LU-factorize it (partial pivoting) into `ws.shift` — or into the
+separately held `sh`, resized to `ws` if needed — transposed, in `Gt`.  `≈n²`
+multiply–adds.  `(σ, τ) = (1, -γ)` gives `I - γJ`; `(0, 1)` gives `J` itself.  The shift is
+converted to the `LHLShift`'s element type: a complex `σ` or `τ` needs one built for
+complex shifts (`LHLWorkspace{T}(n; shift = Complex{T})`, `lhl(J; shift = Complex{T})` or
+`LHLShift{Complex{T}}(ws)`), and throws an `ArgumentError` otherwise.  A zero pivot is
+reported in `info` (the index of the first), not thrown.
 
 An upper Hessenberg matrix has one subdiagonal, so each elimination step chooses between
 two candidates and the element growth factor is bounded by `n` — far tighter than the
 `2ⁿ⁻¹` of general partial pivoting.
 """
-function lhl_shift!(ws::LHLWorkspace{T}, σ, τ) where {T}
-    n = ws.n
-    σ = convert(T, σ)
-    τ = convert(T, τ)
-    n == 0 && return ws
-    if T <: Union{Float32, Float64} && n >= _LHL_SHIFT_FUSED_MIN
-        # Four rows per pass; `Gt`'s padded leading dimension keeps its columns out of the
-        # L1 set the four `Ht` columns share when the stride is a multiple of 4 KiB.
-        info = _lhl_shift_fused!(Val(4), ws, σ, τ)
-    else
-        info = _lhl_shift_rows!(ws, σ, τ)
-    end
-    ws.info = info
+function lhl_shift!(ws::LHLWorkspace, σ, τ)
+    lhl_shift!(ws.shift, ws, σ, τ)
     return ws
 end
 
-const _LHL_SHIFT_FUSED_MIN = 512
+function lhl_shift!(sh::LHLShift{TG}, ws::LHLWorkspace{T}, σ, τ) where {TG, T}
+    n = ws.n
+    (TG === T || TG === Complex{real(T)}) || throw(
+        ArgumentError("an LHLShift{$TG} cannot serve a workspace of element type $T")
+    )
+    if TG <: Real && !(isreal(σ) && isreal(τ))
+        throw(
+            ArgumentError(
+                "complex shift ($σ, $τ) on an LHLShift{$TG}; build the workspace with " *
+                    "`shift = Complex{$T}` or use an `LHLShift{Complex{$T}}`"
+            )
+        )
+    end
+    σ = convert(TG, σ)
+    τ = convert(TG, τ)
+    _lhl_resize!(sh, n)
+    sh.σ = σ
+    sh.τ = τ
+    n == 0 && return sh
+    if real(T) <: Union{Float32, Float64} && n >= _lhl_shift_fused_min(TG)
+        # Four rows per pass; `Gt`'s padded leading dimension keeps its columns out of the
+        # L1 set the four `Ht` columns share when the stride is a multiple of 4 KiB.
+        info = _lhl_shift_fused!(Val(4), sh, ws, σ, τ)
+    else
+        info = _lhl_shift_rows!(sh, ws, σ, τ)
+    end
+    sh.info = info
+    return sh
+end
+
+# Below these sizes the one-step passes win: their inner loops are shorter and the fused
+# passes' triangles cost more per step; a complex shift, whose passes store twice as much,
+# gains from fusing earlier.
+_lhl_shift_fused_min(::Type{TG}) where {TG} = TG <: Complex ? 128 : 512
+
+# Element access on the shift's storage: for a complex `TG` the value at (row j[, column c])
+# is the pair at rows j and o+j of the two planes.
+@inline _lhl_get(::Type{TG}, A::AbstractVector, o::Int, j::Int) where {TG} = @inbounds A[j]
+@inline _lhl_get(::Type{Complex{Tr}}, A::AbstractVector, o::Int, j::Int) where {Tr} =
+    @inbounds Complex(A[j], A[o + j])
+@inline _lhl_get(::Type{TG}, A::AbstractMatrix, o::Int, j::Int, c::Int) where {TG} = @inbounds A[j, c]
+@inline _lhl_get(::Type{Complex{Tr}}, A::AbstractMatrix, o::Int, j::Int, c::Int) where {Tr} =
+    @inbounds Complex(A[j, c], A[o + j, c])
+@inline _lhl_set!(::Type{TG}, A::AbstractVector, o::Int, j::Int, v) where {TG} = @inbounds A[j] = v
+@inline function _lhl_set!(::Type{Complex{Tr}}, A::AbstractVector, o::Int, j::Int, v) where {Tr}
+    @inbounds A[j] = real(v)
+    @inbounds A[o + j] = imag(v)
+    return v
+end
+@inline _lhl_set!(::Type{TG}, A::AbstractMatrix, o::Int, j::Int, c::Int, v) where {TG} = @inbounds A[j, c] = v
+@inline function _lhl_set!(::Type{Complex{Tr}}, A::AbstractMatrix, o::Int, j::Int, c::Int, v) where {Tr}
+    @inbounds A[j, c] = real(v)
+    @inbounds A[o + j, c] = imag(v)
+    return v
+end
+
+# Pivot magnitude: |re| + |im| for complex pivots, as LAPACK's izamax — no square root and
+# no overflow, and within √2 of the modulus.
+@inline _lhl_pivmag(x::Real) = abs(x)
+@inline _lhl_pivmag(x::Complex) = abs(real(x)) + abs(imag(x))
 
 # Row k of G is formed from Ht only when it enters the elimination, and the row that has
 # not yet been chosen as a pivot row lives in `r`: at step k the candidates are the
 # pending row (`r`, currently row k) and the fresh row k+1, whichever wins is written to
 # Gt[:, k] as row k of U, and the loser minus its multiple becomes the new pending row.
 # No row of G is ever copied twice and no interchange is ever performed on storage.
-@inline function _lhl_shift_rows!(ws::LHLWorkspace{T}, σ::T, τ::T) where {T}
+# `TG` real or complex: with a complex shift every product is written out on the planes,
+# in the same term order as `Complex` arithmetic, so the inner loops stay real ones.
+@inline function _lhl_shift_rows!(sh::LHLShift{TG}, ws::LHLWorkspace, σ::TG, τ::TG) where {TG}
     Ht = ws.Ht
-    Gt = ws.Gt
-    swap = ws.swap
-    r = ws.resid
+    Gt = sh.Gt
+    swap = sh.swap
+    r = sh.work
     n = ws.n
+    o = sh.po
     @inbounds begin
         @simd for j in 1:n
-            r[j] = τ * Ht[j, 1]
+            _lhl_set!(TG, r, o, j, τ * Ht[j, 1])
         end
-        r[1] += σ
+        _lhl_set!(TG, r, o, 1, _lhl_get(TG, r, o, 1) + σ)
         info = 0
         for k in 1:(n - 1)
-            a = r[k]
+            a = _lhl_get(TG, r, o, k)
             b = τ * Ht[k, k + 1]
-            if abs(b) > abs(a)
+            if _lhl_pivmag(b) > _lhl_pivmag(a)
                 swap[k] = true
-                Gt[k, k] = b
+                _lhl_set!(TG, Gt, o, k, k, b)
                 l = a / b
-                Gt[k, k + 1] = l
+                _lhl_set!(TG, Gt, o, k, k + 1, l)
                 @simd for j in (k + 1):n
                     g = τ * Ht[j, k + 1]
-                    Gt[j, k] = g
-                    r[j] -= l * g
+                    _lhl_set!(TG, Gt, o, j, k, g)
+                    _lhl_set!(TG, r, o, j, _lhl_get(TG, r, o, j) - l * g)
                 end
-                Gt[k + 1, k] += σ
-                r[k + 1] -= l * σ
+                _lhl_set!(TG, Gt, o, k + 1, k, _lhl_get(TG, Gt, o, k + 1, k) + σ)
+                _lhl_set!(TG, r, o, k + 1, _lhl_get(TG, r, o, k + 1) - l * σ)
             else
                 swap[k] = false
-                Gt[k, k] = a
+                _lhl_set!(TG, Gt, o, k, k, a)
                 if iszero(a)
                     info == 0 && (info = k)
-                    l = zero(T)
+                    l = zero(TG)
                 else
                     l = b / a
                 end
-                Gt[k, k + 1] = l
+                _lhl_set!(TG, Gt, o, k, k + 1, l)
                 @simd for j in (k + 1):n
-                    rj = r[j]
-                    Gt[j, k] = rj
-                    r[j] = τ * Ht[j, k + 1] - l * rj
+                    rj = _lhl_get(TG, r, o, j)
+                    _lhl_set!(TG, Gt, o, j, k, rj)
+                    _lhl_set!(TG, r, o, j, τ * Ht[j, k + 1] - l * rj)
                 end
-                r[k + 1] += σ
+                _lhl_set!(TG, r, o, k + 1, _lhl_get(TG, r, o, k + 1) + σ)
             end
         end
-        Gt[n, n] = r[n]
-        swap[n] = false
-        iszero(Gt[n, n]) && info == 0 && (info = n)
-        rd = ws.rdiag
+        return _lhl_shift_finish!(sh, info)
+    end
+end
+
+@inline function _lhl_shift_finish!(sh::LHLShift{TG}, info::Int) where {TG}
+    Gt = sh.Gt
+    n = sh.n
+    o = sh.po
+    @inbounds begin
+        rn = _lhl_get(TG, sh.work, o, n)
+        _lhl_set!(TG, Gt, o, n, n, rn)
+        sh.swap[n] = false
+        iszero(rn) && info == 0 && (info = n)
+        rd = sh.rdiag
         @simd for j in 1:n
-            rd[j] = inv(Gt[j, j])
+            rd[j] = inv(_lhl_get(TG, Gt, o, j, j))
         end
     end
     return info
@@ -1475,7 +1707,7 @@ end
 # then decides step k+m), the rest take all R steps in `_lhl_shift_pass!`.  Every element
 # sees exactly the operations of `_lhl_shift_rows!` in the same order.
 @inline function _lhl_shift_decide(a::T, b::T, info::Int, k::Int) where {T}
-    s = abs(b) > abs(a)
+    s = _lhl_pivmag(b) > _lhl_pivmag(a)
     if s
         l = a / b
     elseif iszero(a)
@@ -1490,7 +1722,7 @@ end
 # (a closure over `s`/`l`, which the loop below reassigns, would box them)
 @inline _lhl_fill(::Val{R}, x) where {R} = ntuple(_ -> x, Val(R))
 
-@inline function _lhl_shift_step(s::Bool, l::T, τ::T, h::T, rj::T) where {T}
+@inline function _lhl_shift_step(s::Bool, l::T, τ::T, h, rj::T) where {T}
     g = τ * h
     return ifelse(s, g, rj), ifelse(s, rj - l * g, g - l * rj)
 end
@@ -1499,7 +1731,7 @@ end
 # pivot pattern gets its own branch-free loop.  All loads precede all stores in the body:
 # a store to Gt[j, k] followed by a load of Ht[j, k+2] a 4 KiB multiple away stalls otherwise.
 @generated function _lhl_shift_pass!(
-        ::Val{S}, L::NTuple{R, T}, Ht, Gt, r, n::Int, τ::T, k::Int, j0::Int
+        ::Val{S}, L::NTuple{R, T}, Ht, Gt, r, o::Int, n::Int, τ::T, k::Int, j0::Int
     ) where {S, R, T}
     loads = Expr(:block)
     steps = Expr(:block)
@@ -1509,25 +1741,25 @@ end
         u = Symbol(:u_, i)
         push!(loads.args, :($h = Ht[j, k + $i]))
         push!(steps.args, :(($u, rj) = _lhl_shift_step($(S[i]), L[$i], τ, $h, rj)))
-        push!(stores.args, :(Gt[j, k + $(i - 1)] = $u))
+        push!(stores.args, :(_lhl_set!($T, Gt, o, j, k + $(i - 1), $u)))
     end
     return quote
         @inbounds @simd ivdep for j in j0:n
-            rj = r[j]
+            rj = _lhl_get($T, r, o, j)
             $loads
             $steps
             $stores
-            r[j] = rj
+            _lhl_set!($T, r, o, j, rj)
         end
         return nothing
     end
 end
 
-@generated function _lhl_shift_pass!(S::NTuple{R, Bool}, L, Ht, Gt, r, n, τ, k, j0) where {R}
-    ex = :(_lhl_shift_pass!(Val($(ntuple(_ -> false, R))), L, Ht, Gt, r, n, τ, k, j0))
+@generated function _lhl_shift_pass!(S::NTuple{R, Bool}, L, Ht, Gt, r, o, n, τ, k, j0) where {R}
+    ex = :(_lhl_shift_pass!(Val($(ntuple(_ -> false, R))), L, Ht, Gt, r, o, n, τ, k, j0))
     for idx in 1:(2^R - 1)
         pat = ntuple(i -> (idx >> (i - 1)) & 1 == 1, R)
-        ex = :(idx == $idx ? _lhl_shift_pass!(Val($pat), L, Ht, Gt, r, n, τ, k, j0) : $ex)
+        ex = :(idx == $idx ? _lhl_shift_pass!(Val($pat), L, Ht, Gt, r, o, n, τ, k, j0) : $ex)
     end
     sel = Expr(:block, :(idx = 0))
     for i in 1:R
@@ -1540,19 +1772,20 @@ end
 end
 
 @inline function _lhl_shift_block!(
-        ::Val{R}, Ht, Gt, swap, r, n::Int, σ::T, τ::T, k::Int, info::Int
+        ::Val{R}, Ht, Gt, swap, r, o::Int, n::Int, σ::T, τ::T, k::Int, info::Int
     ) where {R, T}
     @inbounds begin
         b = τ * Ht[k, k + 1]
-        s, l, info = _lhl_shift_decide(r[k], b, info, k)
+        rk = _lhl_get(T, r, o, k)
+        s, l, info = _lhl_shift_decide(rk, b, info, k)
         swap[k] = s
-        Gt[k, k] = ifelse(s, b, r[k])
-        Gt[k, k + 1] = l
+        _lhl_set!(T, Gt, o, k, k, ifelse(s, b, rk))
+        _lhl_set!(T, Gt, o, k, k + 1, l)
         S = _lhl_fill(Val(R), s)
         L = _lhl_fill(Val(R), l)
         for m in 1:R
             j = k + m
-            rj = r[j]
+            rj = _lhl_get(T, r, o, j)
             for i in 1:m
                 s = S[i]
                 l = L[i]
@@ -1569,61 +1802,55 @@ end
                     rj = g - l * rj
                     i == m && (rj += σ)
                 end
-                Gt[j, k + i - 1] = u
+                _lhl_set!(T, Gt, o, j, k + i - 1, u)
             end
-            r[j] = rj
+            _lhl_set!(T, r, o, j, rj)
             if m < R
                 b = τ * Ht[j, j + 1]
                 s, l, info = _lhl_shift_decide(rj, b, info, j)
                 swap[j] = s
-                Gt[j, j] = ifelse(s, b, rj)
-                Gt[j, j + 1] = l
+                _lhl_set!(T, Gt, o, j, j, ifelse(s, b, rj))
+                _lhl_set!(T, Gt, o, j, j + 1, l)
                 S = Base.setindex(S, s, m + 1)
                 L = Base.setindex(L, l, m + 1)
             end
         end
-        _lhl_shift_pass!(S, L, Ht, Gt, r, n, τ, k, k + R + 1)
+        _lhl_shift_pass!(S, L, Ht, Gt, r, o, n, τ, k, k + R + 1)
     end
     return info
 end
 
-function _lhl_shift_fused!(::Val{R}, ws::LHLWorkspace{T}, σ::T, τ::T) where {R, T}
+function _lhl_shift_fused!(::Val{R}, sh::LHLShift{TG}, ws::LHLWorkspace, σ::TG, τ::TG) where {R, TG}
     Ht = ws.Ht
-    Gt = ws.Gt
-    swap = ws.swap
-    r = ws.resid
+    Gt = sh.Gt
+    swap = sh.swap
+    r = sh.work
     n = ws.n
+    o = sh.po
     @inbounds begin
         @simd for j in 1:n
-            r[j] = τ * Ht[j, 1]
+            _lhl_set!(TG, r, o, j, τ * Ht[j, 1])
         end
-        r[1] += σ
+        _lhl_set!(TG, r, o, 1, _lhl_get(TG, r, o, 1) + σ)
         info = 0
         k = 1
         while k + R - 1 <= n - 1
-            info = _lhl_shift_block!(Val(R), Ht, Gt, swap, r, n, σ, τ, k, info)
+            info = _lhl_shift_block!(Val(R), Ht, Gt, swap, r, o, n, σ, τ, k, info)
             k += R
         end
         while k <= n - 1
-            info = _lhl_shift_block!(Val(1), Ht, Gt, swap, r, n, σ, τ, k, info)
+            info = _lhl_shift_block!(Val(1), Ht, Gt, swap, r, o, n, σ, τ, k, info)
             k += 1
         end
-        Gt[n, n] = r[n]
-        swap[n] = false
-        iszero(Gt[n, n]) && info == 0 && (info = n)
-        rd = ws.rdiag
-        @simd for j in 1:n
-            rd[j] = inv(Gt[j, j])
-        end
+        return _lhl_shift_finish!(sh, info)
     end
-    return info
 end
 
-function _hessenberg_solve!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
-    Gt = ws.Gt
-    rd = ws.rdiag
-    n = ws.n
-    _lhl_hess_forward!(x, Gt, ws.swap, n)
+function _hessenberg_solve!(x::AbstractVector, sh::LHLShift{T, T}) where {T}
+    Gt = sh.Gt
+    rd = sh.rdiag
+    n = sh.n
+    _lhl_hess_forward!(x, Gt, sh.swap, n)
     # Back substitution four rows at a time.  The dot products of block j-4:j-7 over
     # x[j+1:n] do not depend on x[j-3:j], so they are issued right after the 4×4 triangle of
     # block j: the vector loop overlaps the serial chain instead of waiting for it.
@@ -1691,19 +1918,166 @@ function _lhl_hess_forward!(x::AbstractVector, Gt::AbstractMatrix, swap::Vector{
     return x
 end
 
-# On the padded buffer: same pipelining, the four dot products as vector accumulators
-# running to a full vector past n (Gt's pad rows and y's pad are zero).
-_hessenberg_solve_buf!(y::AbstractVector, ws::LHLWorkspace) = _hessenberg_solve!(y, ws)
+@inline _lhl_cget(Gt, o::Int, i::Int, c::Int) = Complex(Gt[i, c], Gt[o + i, c])
 
-function _hessenberg_solve_buf!(y::Vector{T}, ws::LHLWorkspace{T}) where {T <: Union{Float32, Float64}}
+# The complex solve on the planar buffer (`y[1:n]` real parts, `y[o+1:o+n]` imaginary
+# parts, planar `Gt`): the same pipelined back substitution as `_hessenberg_solve!`, each
+# complex product written out on the two planes.
+function _hessenberg_solve_planar!(y::Vector{Tr}, sh::LHLShift{Complex{Tr}, Tr}) where {Tr}
+    Gt = sh.Gt
+    rd = sh.rdiag
+    swap = sh.swap
+    n = sh.n
+    o = sh.po
+    C = Complex{Tr}
+    @inbounds for k in 1:(n - 1)
+        s = swap[k]
+        a = C(y[k], y[o + k])
+        b = C(y[k + 1], y[o + k + 1])
+        xk = ifelse(s, b, a)
+        y[k] = real(xk)
+        y[o + k] = imag(xk)
+        v = ifelse(s, a, b) - C(Gt[k, k + 1], Gt[o + k, k + 1]) * xk
+        y[k + 1] = real(v)
+        y[o + k + 1] = imag(v)
+    end
+    j = n
+    s1 = s2 = s3 = s4 = zero(C)
+    @inbounds while j - 3 >= 1
+        xj = (C(y[j], y[o + j]) - s1) * rd[j]
+        y[j] = real(xj)
+        y[o + j] = imag(xj)
+        s2 += C(Gt[j, j - 1], Gt[o + j, j - 1]) * xj
+        s3 += C(Gt[j, j - 2], Gt[o + j, j - 2]) * xj
+        s4 += C(Gt[j, j - 3], Gt[o + j, j - 3]) * xj
+        xj1 = (C(y[j - 1], y[o + j - 1]) - s2) * rd[j - 1]
+        y[j - 1] = real(xj1)
+        y[o + j - 1] = imag(xj1)
+        s3 += C(Gt[j - 1, j - 2], Gt[o + j - 1, j - 2]) * xj1
+        s4 += C(Gt[j - 1, j - 3], Gt[o + j - 1, j - 3]) * xj1
+        xj2 = (C(y[j - 2], y[o + j - 2]) - s3) * rd[j - 2]
+        y[j - 2] = real(xj2)
+        y[o + j - 2] = imag(xj2)
+        s4 += C(Gt[j - 2, j - 3], Gt[o + j - 2, j - 3]) * xj2
+        xj3 = (C(y[j - 3], y[o + j - 3]) - s4) * rd[j - 3]
+        y[j - 3] = real(xj3)
+        y[o + j - 3] = imag(xj3)
+        jn = j - 4
+        if jn - 3 >= 1
+            s1, s2, s3, s4 = _lhl_pdot4(y, Gt, o, jn, jn, n)
+        end
+        j = jn
+    end
+    @inbounds while j >= 1
+        sr = si = zero(Tr)
+        @simd for i in (j + 1):n
+            xr = y[i]
+            xi = y[o + i]
+            gr = Gt[i, j]
+            gi = Gt[o + i, j]
+            sr += gr * xr - gi * xi
+            si += gr * xi + gi * xr
+        end
+        xj = (C(y[j], y[o + j]) - C(sr, si)) * rd[j]
+        y[j] = real(xj)
+        y[o + j] = imag(xj)
+        j -= 1
+    end
+    return y
+end
+
+# The four complex dot products Σᵢ Gt[i, jn-c]·y[i], i = j+1:n, c = 0:3, on the planes.
+@inline function _lhl_pdot4(y::AbstractVector{Tr}, Gt::AbstractMatrix{Tr}, o::Int, j::Int, jn::Int, n::Int) where {Tr}
+    t1r = t1i = t2r = t2i = t3r = t3i = t4r = t4i = zero(Tr)
+    @inbounds @simd for i in (j + 1):n
+        xr = y[i]
+        xi = y[o + i]
+        g1r = Gt[i, jn]
+        g1i = Gt[o + i, jn]
+        g2r = Gt[i, jn - 1]
+        g2i = Gt[o + i, jn - 1]
+        g3r = Gt[i, jn - 2]
+        g3i = Gt[o + i, jn - 2]
+        g4r = Gt[i, jn - 3]
+        g4i = Gt[o + i, jn - 3]
+        t1r += g1r * xr - g1i * xi
+        t1i += g1r * xi + g1i * xr
+        t2r += g2r * xr - g2i * xi
+        t2i += g2r * xi + g2i * xr
+        t3r += g3r * xr - g3i * xi
+        t3i += g3r * xi + g3i * xr
+        t4r += g4r * xr - g4i * xi
+        t4i += g4r * xi + g4i * xr
+    end
+    return Complex(t1r, t1i), Complex(t2r, t2i), Complex(t3r, t3i), Complex(t4r, t4i)
+end
+
+# Explicit vectors, running to a full vector past n (the pads of both planes are zero):
+# eight accumulators, one real and one imaginary per column.
+@inline function _lhl_pdot4(y::Vector{T}, Gt::Matrix{T}, o::Int, j::Int, jn::Int, n::Int) where {T <: Union{Float32, Float64}}
     V = _lhl_vectype(T)
     W = _LHL_VEC_BYTES ÷ sizeof(T)
     sz = sizeof(T)
-    Gt = ws.Gt
-    rd = ws.rdiag
-    n = ws.n
     ldg = size(Gt, 1)
-    _lhl_hess_forward!(y, Gt, ws.swap, n)
+    GC.@preserve y Gt begin
+        c1 = pointer(Gt) + ((jn - 1) * ldg + j) * sz
+        c2 = c1 - ldg * sz
+        c3 = c2 - ldg * sz
+        c4 = c3 - ldg * sz
+        q = pointer(y) + j * sz
+        ob = o * sz
+        mb = cld(n - j, W) * W * sz
+        z = _lhl_bcast(V, zero(T))
+        a1r = a1i = a2r = a2i = a3r = a3i = a4r = a4i = z
+        d = 0
+        while d < mb
+            xr = _lhl_vload(V, q + d)
+            xi = _lhl_vload(V, q + ob + d)
+            nxi = _lhl_vneg(xi)
+            g = _lhl_vload(V, c1 + d)
+            a1r = _lhl_fma(g, xr, a1r)
+            a1i = _lhl_fma(g, xi, a1i)
+            g = _lhl_vload(V, c1 + ob + d)
+            a1r = _lhl_fma(g, nxi, a1r)
+            a1i = _lhl_fma(g, xr, a1i)
+            g = _lhl_vload(V, c2 + d)
+            a2r = _lhl_fma(g, xr, a2r)
+            a2i = _lhl_fma(g, xi, a2i)
+            g = _lhl_vload(V, c2 + ob + d)
+            a2r = _lhl_fma(g, nxi, a2r)
+            a2i = _lhl_fma(g, xr, a2i)
+            g = _lhl_vload(V, c3 + d)
+            a3r = _lhl_fma(g, xr, a3r)
+            a3i = _lhl_fma(g, xi, a3i)
+            g = _lhl_vload(V, c3 + ob + d)
+            a3r = _lhl_fma(g, nxi, a3r)
+            a3i = _lhl_fma(g, xr, a3i)
+            g = _lhl_vload(V, c4 + d)
+            a4r = _lhl_fma(g, xr, a4r)
+            a4i = _lhl_fma(g, xi, a4i)
+            g = _lhl_vload(V, c4 + ob + d)
+            a4r = _lhl_fma(g, nxi, a4r)
+            a4i = _lhl_fma(g, xr, a4i)
+            d += W * sz
+        end
+    end
+    return Complex(_lhl_vsum(a1r), _lhl_vsum(a1i)), Complex(_lhl_vsum(a2r), _lhl_vsum(a2i)),
+        Complex(_lhl_vsum(a3r), _lhl_vsum(a3i)), Complex(_lhl_vsum(a4r), _lhl_vsum(a4i))
+end
+
+# On the padded buffer: same pipelining, the four dot products as vector accumulators
+# running to a full vector past n (Gt's pad rows and y's pad are zero).
+_hessenberg_solve_buf!(y::AbstractVector, sh::LHLShift) = _hessenberg_solve!(y, sh)
+
+function _hessenberg_solve_buf!(y::Vector{T}, sh::LHLShift{T, T}) where {T <: Union{Float32, Float64}}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    Gt = sh.Gt
+    rd = sh.rdiag
+    n = sh.n
+    ldg = size(Gt, 1)
+    _lhl_hess_forward!(y, Gt, sh.swap, n)
     GC.@preserve y Gt begin
         py = pointer(y)
         pG = pointer(Gt)
@@ -1771,20 +2145,25 @@ end
 
 """
     lhl_ldiv!(x, ws)
+    lhl_ldiv!(x, sh::LHLShift, ws)
 
-`x ← W⁻¹x` for the `W` currently loaded by [`lhl_shift!`](@ref): `Z⁻¹`, Hessenberg solve,
-`Z`.  `3n²/2` multiply–adds.  Uses `ws.xbuf` as scratch, so concurrent solves must each
-have their own workspace.
+`x ← W⁻¹x` for the `W` currently loaded by [`lhl_shift!`](@ref) into `ws.shift` (or into
+`sh`): `Z⁻¹`, Hessenberg solve, `Z`.  `3n²/2` multiply–adds.  `x` must be able to hold the
+shift's element type (a real `x` cannot take a complex shift).  Uses the shift's `xbuf` as
+scratch, so concurrent solves must each have their own.
 """
-function lhl_ldiv!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
+lhl_ldiv!(x::AbstractVector, ws::LHLWorkspace) = lhl_ldiv!(x, ws.shift, ws)
+
+function lhl_ldiv!(x::AbstractVector, sh::LHLShift{TG}, ws::LHLWorkspace) where {TG}
     n = ws.n
     length(x) == n || throw(DimensionMismatch("x has length $(length(x)), the workspace is $n×$n"))
-    if eltype(x) === T
-        y = ws.xbuf
+    sh.n == n || throw(DimensionMismatch("the LHLShift is $(sh.n)×$(sh.n), the workspace $n×$n"))
+    if eltype(x) === TG
+        y = sh.xbuf
         _lhl_gather!(y, x, ws)
-        _lhl_zinvsweep_buf!(y, ws.Lp, n)
-        _hessenberg_solve_buf!(y, ws)
-        _lhl_zsweep_buf!(y, ws.Lp, n)
+        _lhl_zinvsweep_buf!(y, 0, ws.Lp, n)
+        _hessenberg_solve_buf!(y, sh)
+        _lhl_zsweep_buf!(y, 0, ws.Lp, n)
         d = ws.scale
         ip = ws.iperm
         @inbounds for i in 1:n
@@ -1792,29 +2171,89 @@ function lhl_ldiv!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
         end
     else
         applyZinv!(x, ws)
-        _hessenberg_solve!(x, ws)
+        _hessenberg_solve!(x, sh)
         applyZ!(x, ws)
     end
     return x
 end
 
+# A complex shift on a real reduction: gather into the two planes, sweep each with the real
+# multipliers, solve on the planes, scatter.  On a complex reduction the sweeps run on `x`
+# itself (the multipliers are complex) and only the Hessenberg solve goes through the planes.
+function lhl_ldiv!(x::AbstractVector, sh::LHLShift{Complex{Tr}, Tr}, ws::LHLWorkspace{T}) where {Tr, T}
+    n = ws.n
+    length(x) == n || throw(DimensionMismatch("x has length $(length(x)), the workspace is $n×$n"))
+    sh.n == n || throw(DimensionMismatch("the LHLShift is $(sh.n)×$(sh.n), the workspace $n×$n"))
+    eltype(x) <: Real &&
+        throw(ArgumentError("a real x cannot hold the solution of a complex shift; use a Vector{$(Complex{Tr})}"))
+    y = sh.xbuf
+    o = sh.po
+    Lp = ws.Lp
+    if T <: Real
+        perm = ws.perm
+        isc = ws.iscale
+        @inbounds for i in 1:n
+            p = perm[i]
+            v = x[p] * isc[p]
+            y[i] = real(v)
+            y[o + i] = imag(v)
+        end
+        _lhl_zero_planes!(y, n, o)
+        _lhl_zinvsweep_buf!(y, 0, o, Lp, n)
+        _hessenberg_solve_planar!(y, sh)
+        _lhl_zsweep_buf!(y, 0, o, Lp, n)
+        d = ws.scale
+        ip = ws.iperm
+        @inbounds for i in 1:n
+            p = ip[i]
+            x[i] = Complex(y[p], y[o + p]) * d[i]
+        end
+    else
+        applyZinv!(x, ws)
+        @inbounds for i in 1:n
+            v = x[i]
+            y[i] = real(v)
+            y[o + i] = imag(v)
+        end
+        _lhl_zero_planes!(y, n, o)
+        _hessenberg_solve_planar!(y, sh)
+        @inbounds for i in 1:n
+            x[i] = Complex(y[i], y[o + i])
+        end
+        applyZ!(x, ws)
+    end
+    return x
+end
+
+function _lhl_zero_planes!(y::Vector{T}, n::Int, o::Int) where {T}
+    @inbounds for i in (n + 1):o
+        y[i] = zero(T)
+        y[o + i] = zero(T)
+    end
+    return y
+end
+
 
 """
     lhl_refine!(x, A, b, ws, steps)
+    lhl_refine!(x, A, b, sh::LHLShift, ws, steps)
 
 Apply `steps` rounds of fixed-precision iterative refinement to a solve of `A x = b`, where
-`ws` holds the factorization of `A`.  `Z` is not orthogonal, so the raw solve's backward
-error carries a factor `κ(Z)`; refinement buys it back for the price of a matvec and a
-second `O(n²)` solve (Skeel 1980).  One step is enough to match LU's backward error even on
-matrices where `κ(Z)` reaches `10¹⁰`.
+`ws` (with `ws.shift`, or with `sh`) holds the factorization of `A`.  `Z` is not orthogonal,
+so the raw solve's backward error carries a factor `κ(Z)`; refinement buys it back for the
+price of a matvec and a second `O(n²)` solve (Skeel 1980).  One step is enough to match
+LU's backward error even on matrices where `κ(Z)` reaches `10¹⁰`.
 """
-function lhl_refine!(x::AbstractVector, A, b::AbstractVector, ws::LHLWorkspace, steps::Int)
+lhl_refine!(x::AbstractVector, A, b::AbstractVector, ws::LHLWorkspace, steps::Int) =
+    lhl_refine!(x, A, b, ws.shift, ws, steps)
+
+function lhl_refine!(x::AbstractVector, A, b::AbstractVector, sh::LHLShift, ws::LHLWorkspace, steps::Int)
     steps <= 0 && return x
-    r = ws.resid
+    r = sh.resid
     for _ in 1:steps
         mul!(r, A, x)
         r .= b .- r
-        lhl_ldiv!(r, ws)
+        lhl_ldiv!(r, sh, ws)
         x .+= r
     end
     return x
@@ -1822,16 +2261,18 @@ end
 
 
 """
-    lhl(J; balance = true) -> LHLWorkspace
+    lhl(J; balance = true, shift = eltype(J)) -> LHLWorkspace
     lhl!(ws, J; balance = true) -> LHLWorkspace
 
 Reduce `J` to upper Hessenberg form by Gaussian similarity with partial pivoting.  `J` is
-not modified.  `lhl!` reuses an existing workspace, resizing it if needed.
+not modified.  `lhl!` reuses an existing workspace, resizing it if needed.  `shift` is the
+element type of the shifts and solves; `Complex{eltype(J)}` on a real `J` keeps the
+reduction real and makes only the shifted half complex (see [`LHLShift`](@ref)).
 
 Follow with [`lhl_shift!`](@ref) to load a shift and [`lhl_ldiv!`](@ref) to solve.
 """
-function lhl(J::AbstractMatrix; balance::Bool = true)
-    ws = LHLWorkspace{eltype(J)}(checksquare(J))
+function lhl(J::AbstractMatrix; balance::Bool = true, shift::Type = eltype(J))
+    ws = LHLWorkspace{eltype(J)}(checksquare(J); shift)
     lhl_reduce!(ws, J, balance)
     return ws
 end
