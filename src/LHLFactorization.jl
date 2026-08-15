@@ -1133,19 +1133,38 @@ two candidates and the element growth factor is bounded by `n` — far tighter t
 `2ⁿ⁻¹` of general partial pivoting.
 """
 function lhl_shift!(ws::LHLWorkspace{T}, σ, τ) where {T}
+    n = ws.n
+    σ = convert(T, σ)
+    τ = convert(T, τ)
+    n == 0 && return ws
+    if T <: Union{Float32, Float64} && n >= _LHL_SHIFT_FUSED_MIN
+        # Columns a multiple of 4 KiB apart map to one L1 set: four of `Ht` plus four of `Gt`
+        # fill its eight ways and the fused pass thrashes, so those strides get two rows.
+        if (n * sizeof(T)) % 4096 == 0
+            info = _lhl_shift_fused!(Val(2), ws, σ, τ)
+        else
+            info = _lhl_shift_fused!(Val(4), ws, σ, τ)
+        end
+    else
+        info = _lhl_shift_rows!(ws, σ, τ)
+    end
+    ws.info = info
+    return ws
+end
+
+const _LHL_SHIFT_FUSED_MIN = 512
+
+# Row k of G is formed from Ht only when it enters the elimination, and the row that has
+# not yet been chosen as a pivot row lives in `r`: at step k the candidates are the
+# pending row (`r`, currently row k) and the fresh row k+1, whichever wins is written to
+# Gt[:, k] as row k of U, and the loser minus its multiple becomes the new pending row.
+# No row of G is ever copied twice and no interchange is ever performed on storage.
+@inline function _lhl_shift_rows!(ws::LHLWorkspace{T}, σ::T, τ::T) where {T}
     Ht = ws.Ht
     Gt = ws.Gt
     swap = ws.swap
     r = ws.resid
     n = ws.n
-    σ = convert(T, σ)
-    τ = convert(T, τ)
-    n == 0 && return ws
-    # Row k of G is formed from Ht only when it enters the elimination, and the row that has
-    # not yet been chosen as a pivot row lives in `r`: at step k the candidates are the
-    # pending row (`r`, currently row k) and the fresh row k+1, whichever wins is written to
-    # Gt[:, k] as row k of U, and the loser minus its multiple becomes the new pending row.
-    # No row of G is ever copied twice and no interchange is ever performed on storage.
     @inbounds begin
         @simd for j in 1:n
             r[j] = τ * Ht[j, 1]
@@ -1193,8 +1212,157 @@ function lhl_shift!(ws::LHLWorkspace{T}, σ, τ) where {T}
             rd[j] = inv(Gt[j, j])
         end
     end
-    ws.info = info
-    return ws
+    return info
+end
+
+# The same elimination, R steps per pass over the pending row: element j reads Ht[j, k+1:k+R]
+# and r[j] once and writes Gt[j, k:k+R-1] and r[j] once, R+1 loads and R+1 stores instead
+# of 2R and 2R.  Elements k+1..k+R form a triangle (element k+m takes steps k..k+m-1 and
+# then decides step k+m), the rest take all R steps in `_lhl_shift_pass!`.  Every element
+# sees exactly the operations of `_lhl_shift_rows!` in the same order.
+@inline function _lhl_shift_decide(a::T, b::T, info::Int, k::Int) where {T}
+    s = abs(b) > abs(a)
+    if s
+        l = a / b
+    elseif iszero(a)
+        info == 0 && (info = k)
+        l = zero(T)
+    else
+        l = b / a
+    end
+    return s, l, info
+end
+
+# (a closure over `s`/`l`, which the loop below reassigns, would box them)
+@inline _lhl_fill(::Val{R}, x) where {R} = ntuple(_ -> x, Val(R))
+
+@inline function _lhl_shift_step(s::Bool, l::T, τ::T, h::T, rj::T) where {T}
+    g = τ * h
+    return ifelse(s, g, rj), ifelse(s, rj - l * g, g - l * rj)
+end
+
+# Steps k..k+R-1 with decisions S on elements j0:n; S is a compile-time tuple so that each
+# pivot pattern gets its own branch-free loop.  All loads precede all stores in the body:
+# a store to Gt[j, k] followed by a load of Ht[j, k+2] a 4 KiB multiple away stalls otherwise.
+@generated function _lhl_shift_pass!(
+        ::Val{S}, L::NTuple{R, T}, Ht, Gt, r, n::Int, τ::T, k::Int, j0::Int
+    ) where {S, R, T}
+    loads = Expr(:block)
+    steps = Expr(:block)
+    stores = Expr(:block)
+    for i in 1:R
+        h = Symbol(:h_, i)
+        u = Symbol(:u_, i)
+        push!(loads.args, :($h = Ht[j, k + $i]))
+        push!(steps.args, :(($u, rj) = _lhl_shift_step($(S[i]), L[$i], τ, $h, rj)))
+        push!(stores.args, :(Gt[j, k + $(i - 1)] = $u))
+    end
+    return quote
+        @inbounds @simd ivdep for j in j0:n
+            rj = r[j]
+            $loads
+            $steps
+            $stores
+            r[j] = rj
+        end
+        return nothing
+    end
+end
+
+@generated function _lhl_shift_pass!(S::NTuple{R, Bool}, L, Ht, Gt, r, n, τ, k, j0) where {R}
+    ex = :(_lhl_shift_pass!(Val($(ntuple(_ -> false, R))), L, Ht, Gt, r, n, τ, k, j0))
+    for idx in 1:(2^R - 1)
+        pat = ntuple(i -> (idx >> (i - 1)) & 1 == 1, R)
+        ex = :(idx == $idx ? _lhl_shift_pass!(Val($pat), L, Ht, Gt, r, n, τ, k, j0) : $ex)
+    end
+    sel = Expr(:block, :(idx = 0))
+    for i in 1:R
+        push!(sel.args, :(idx |= Int(S[$i]) << $(i - 1)))
+    end
+    return quote
+        $sel
+        $ex
+    end
+end
+
+@inline function _lhl_shift_block!(
+        ::Val{R}, Ht, Gt, swap, r, n::Int, σ::T, τ::T, k::Int, info::Int
+    ) where {R, T}
+    @inbounds begin
+        b = τ * Ht[k, k + 1]
+        s, l, info = _lhl_shift_decide(r[k], b, info, k)
+        swap[k] = s
+        Gt[k, k] = ifelse(s, b, r[k])
+        Gt[k, k + 1] = l
+        S = _lhl_fill(Val(R), s)
+        L = _lhl_fill(Val(R), l)
+        for m in 1:R
+            j = k + m
+            rj = r[j]
+            for i in 1:m
+                s = S[i]
+                l = L[i]
+                g = τ * Ht[j, k + i]
+                if s
+                    u = g
+                    rj -= l * g
+                    if i == m
+                        u += σ
+                        rj -= l * σ
+                    end
+                else
+                    u = rj
+                    rj = g - l * rj
+                    i == m && (rj += σ)
+                end
+                Gt[j, k + i - 1] = u
+            end
+            r[j] = rj
+            if m < R
+                b = τ * Ht[j, j + 1]
+                s, l, info = _lhl_shift_decide(rj, b, info, j)
+                swap[j] = s
+                Gt[j, j] = ifelse(s, b, rj)
+                Gt[j, j + 1] = l
+                S = Base.setindex(S, s, m + 1)
+                L = Base.setindex(L, l, m + 1)
+            end
+        end
+        _lhl_shift_pass!(S, L, Ht, Gt, r, n, τ, k, k + R + 1)
+    end
+    return info
+end
+
+function _lhl_shift_fused!(::Val{R}, ws::LHLWorkspace{T}, σ::T, τ::T) where {R, T}
+    Ht = ws.Ht
+    Gt = ws.Gt
+    swap = ws.swap
+    r = ws.resid
+    n = ws.n
+    @inbounds begin
+        @simd for j in 1:n
+            r[j] = τ * Ht[j, 1]
+        end
+        r[1] += σ
+        info = 0
+        k = 1
+        while k + R - 1 <= n - 1
+            info = _lhl_shift_block!(Val(R), Ht, Gt, swap, r, n, σ, τ, k, info)
+            k += R
+        end
+        while k <= n - 1
+            info = _lhl_shift_block!(Val(1), Ht, Gt, swap, r, n, σ, τ, k, info)
+            k += 1
+        end
+        Gt[n, n] = r[n]
+        swap[n] = false
+        iszero(Gt[n, n]) && info == 0 && (info = n)
+        rd = ws.rdiag
+        @simd for j in 1:n
+            rd[j] = inv(Gt[j, j])
+        end
+    end
+    return info
 end
 
 function _hessenberg_solve!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
