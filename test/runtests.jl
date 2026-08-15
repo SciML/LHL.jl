@@ -105,6 +105,101 @@ end
     @test lhl_ldiv!(copy(b3), ws) ≈ Matrix(I - 0.3 * J3) \ b3 rtol = 1.0e-9
 end
 
+# The shift as it was before the fused-row pass: one elimination step per pass over the
+# pending row.  The fused kernel must reproduce it bit for bit — same pivots, same rounding —
+# on random matrices and on ones full of exact ties and zero pivots.
+function _lhl_shift_ref!(ws::LHLWorkspace{T}, σ, τ) where {T}
+    Ht, Gt, swap, r, n = ws.Ht, ws.Gt, ws.swap, ws.resid, ws.n
+    σ = convert(T, σ)
+    τ = convert(T, τ)
+    n == 0 && return ws
+    @inbounds begin
+        @simd for j in 1:n
+            r[j] = τ * Ht[j, 1]
+        end
+        r[1] += σ
+        info = 0
+        for k in 1:(n - 1)
+            a = r[k]
+            b = τ * Ht[k, k + 1]
+            if abs(b) > abs(a)
+                swap[k] = true
+                Gt[k, k] = b
+                l = a / b
+                Gt[k, k + 1] = l
+                @simd for j in (k + 1):n
+                    g = τ * Ht[j, k + 1]
+                    Gt[j, k] = g
+                    r[j] -= l * g
+                end
+                Gt[k + 1, k] += σ
+                r[k + 1] -= l * σ
+            else
+                swap[k] = false
+                Gt[k, k] = a
+                if iszero(a)
+                    info == 0 && (info = k)
+                    l = zero(T)
+                else
+                    l = b / a
+                end
+                Gt[k, k + 1] = l
+                @simd for j in (k + 1):n
+                    rj = r[j]
+                    Gt[j, k] = rj
+                    r[j] = τ * Ht[j, k + 1] - l * rj
+                end
+                r[k + 1] += σ
+            end
+        end
+        Gt[n, n] = r[n]
+        swap[n] = false
+        iszero(Gt[n, n]) && info == 0 && (info = n)
+        rd = ws.rdiag
+        @simd for j in 1:n
+            rd[j] = inv(Gt[j, j])
+        end
+    end
+    ws.info = info
+    return ws
+end
+# Everything the solve reads: U (Gt[j, k], j ≥ k), the multipliers Gt[k, k+1], swap, rdiag, info.
+function shift_state(ws)
+    n = ws.n
+    U = [ws.Gt[j, k] for k in 1:n for j in k:n]
+    l = [ws.Gt[k, k + 1] for k in 1:(n - 1)]
+    return (U, l, copy(ws.swap), copy(ws.rdiag), ws.info)
+end
+same_state(a, b) = all(x === y for (u, v) in zip(a, b) for (x, y) in zip(u, v))
+tie_matrix(rng, T, n) = T.(rand(rng, -2:2, n, n))
+@testset "shift matches the reference implementation: $T" for T in (Float64, Float32, ComplexF64)
+    rng = MersenneTwister(31)
+    ns = T <: Real ? vcat(1:300, [511, 512, 513, 520, 640, 768, 1000, 1024]) : 1:120
+    for n in ns, tie in (false, true)
+        J = tie ? tie_matrix(rng, T, n) : randn(rng, T, n, n)
+        ws = lhl(J)
+        wr = deepcopy(ws)
+        for (σ, τ) in ((1, -0.1), (0, 1), (1, -3), (2, 0), (0, 0))
+            _lhl_shift_ref!(wr, σ, τ)
+            lhl_shift!(ws, σ, τ)
+            @test same_state(shift_state(wr), shift_state(ws))
+        end
+    end
+    # the fused kernels below their size threshold, all row counts, plus the tie/zero cases
+    if T <: Real
+        for n in 1:80, tie in (false, true), R in (1, 2, 3, 4)
+            J = tie ? tie_matrix(rng, T, n) : randn(rng, T, n, n)
+            ws = lhl(J)
+            wr = deepcopy(ws)
+            for (σ, τ) in ((1, -0.1), (0, 1), (2, 0))
+                _lhl_shift_ref!(wr, σ, τ)
+                ws.info = LHLFactorization._lhl_shift_fused!(Val(R), ws, T(σ), T(τ))
+                @test same_state(shift_state(wr), shift_state(ws))
+            end
+        end
+    end
+end
+
 @testset "singular shift is reported, not thrown" begin
     ws = lhl([1.0 0.0; 0.0 2.0])
     lhl_shift!(ws, 1, -1.0)          # I - J is singular in the first coordinate
@@ -176,6 +271,11 @@ end
     lhl_ldiv!(x, ws)
     @test @allocated(lhl_shift!(ws, 1, -0.4)) == 0
     @test @allocated(lhl_ldiv!(x, ws)) == 0
+    for (T, m) in ((Float64, 512), (Float64, 520), (Float32, 520), (Float32, 1024))   # fused shift, R = 2 and 4
+        wsm = lhl(randn(MersenneTwister(m), T, m, m))
+        lhl_shift!(wsm, 1, -0.3)
+        @test @allocated(lhl_shift!(wsm, 1, -0.4)) == 0
+    end
 end
 
 # The explicit-vector trailing update (unit-stride Float32/Float64) must give the same
