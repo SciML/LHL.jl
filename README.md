@@ -1,6 +1,6 @@
 # LHL.jl
 
-[![CI](https://github.com/SciML/LHL.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/SciML/LHL.jl/actions/workflows/CI.yml)
+[![CI](https://github.com/SciML/LHL.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/SciML/LHL.jl/actions/workflows/CI.yml?query=branch%3Amaster)
 [![SciML Code Style](https://img.shields.io/static/v1?label=code%20style&message=SciML&color=9558b2&labelColor=389826)](https://github.com/SciML/SciMLStyle)
 
 Solve a whole family of shifted linear systems

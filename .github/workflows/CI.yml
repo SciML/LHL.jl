@@ -1,12 +1,12 @@
 name: CI
 on:
   push:
-    branches: [main]
+    branches: [master]
     tags: ['*']
   pull_request:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 jobs:
   test:
     runs-on: ${{ matrix.os }}
