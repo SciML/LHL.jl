@@ -117,8 +117,10 @@ than caching one per shift.
 ### Threading
 
 `lhl(J; thread = Val(true))` (the default; `Val(false)` or `false` to disable) runs the
-blocked reduction on [Polyester](https://github.com/JuliaSIMD/Polyester.jl) threads when
-`Threads.nthreads() > 1`: the per-step trailing GEMV in column groups, the panel's row work
+blocked reduction on [Polyester](https://github.com/JuliaSIMD/Polyester.jl) threads.
+Threading requires `using Polyester` (which loads the `LHLFactorizationPolyesterExt`
+extension; Polyester is a weak dependency) and `julia -t N`; without either,
+`thread = Val(true)` silently runs the serial code.  Threaded: the per-step trailing GEMV in column groups, the panel's row work
 in row chunks, and the panel-end GEMMs, triangular solve and interchange sweeps in the same
 column groups.  Every partition depends on the sizes only, so `factors`, `Lp`, `Ht` and the
 solves are bit-identical for any thread count.  Measured on an EPYC 7502 (Float64, Julia
@@ -129,9 +131,9 @@ runs 1.5×/2.2×/2.0×/1.7× faster at `n = 512`, 1.7×/2.6×/2.8×/3.0× at `n 
 row work and the balancing are what remains serial-bound).  The unblocked path (`n < 500`)
 and the shifts and solves stay serial (a row-split unblocked sweep measured slower than
 serial: the per-step row interchange moves two rows' worth of cache lines between the
-cores).  Polyester and its dependencies add
-about 0.15–0.35 s to `using LHLFactorization`; a precompile workload keeps the first
-`lhl`/`lhl_shift!`/`lhl_ldiv!` under 0.1 s.
+cores).  `using Polyester` adds about 0.15–0.35 s of load time; precompile workloads in the
+package and the extension keep the first `lhl`/`lhl_shift!`/`lhl_ldiv!` under ~0.1 s in
+both configurations.
 
 ## Stability
 
