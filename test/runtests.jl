@@ -66,7 +66,7 @@ end
         copyto!(wb.factors, J)
         balance ? LHL._lhl_balance!(wb.factors, wb.scale, wb.iscale) : fill!(wb.scale, 1)
         wu = deepcopy(wb)
-        LHL._lhl_reduce_blocked!(wb.factors, wb.ipiv, wb.Ht, wb.work, wb.pack, LHL._lhl_panel_width(n))
+        LHL._lhl_reduce_blocked!(LHL.LHLSerial(), wb.factors, wb.ipiv, wb.Ht, wb.work, wb.pack, LHL._lhl_panel_width(n))
         LHL._lhl_reduce_unblocked!(wu.factors, wu.ipiv)
         return wb, wu
     end
@@ -457,3 +457,10 @@ end
         @test Ag ≈ Ae
     end
 end
+
+# The threading testset runs twice: without Polyester (`thread = Val(true)` must then be
+# the serial path) and, after `using Polyester`, with the extension loaded.
+include("threading.jl")
+threading_tests()
+using Polyester
+threading_tests()
