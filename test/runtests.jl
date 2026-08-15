@@ -3,7 +3,8 @@ using LHLFactorization, LinearAlgebra, Random, Test
 bwd(W, x, b) = norm(b - W * x, Inf) / (opnorm(W, Inf) * norm(x, Inf) + norm(b, Inf))
 
 @testset "reduction reconstructs J" begin
-    for n in (1, 2, 3, 4, 17, 80, 128, 200, 301), balance in (true, false)
+    # 600 and 1030 take the blocked path by default; 1030 (and 128, 200) pad `fstore`
+    for n in (1, 2, 3, 4, 17, 80, 128, 200, 301, 600, 1030), balance in (true, false)
         J = randn(MersenneTwister(n), n, n)
         ws = lhl(J; balance)
         Z = Matrix{Float64}(I, n, n)
@@ -177,8 +178,8 @@ end
     @test @allocated(lhl_ldiv!(x, ws)) == 0
 end
 
-# The explicit-vector trailing update (Matrix{Float32/Float64}) must give the same
-# reduction as the generic paired sweep, which a view of the same matrix dispatches to.
+# The explicit-vector trailing update (unit-stride Float32/Float64) must give the same
+# reduction as the generic paired sweep, which a row-strided view dispatches to.
 # Float32 results from the two differ by summation order alone, and at n ≈ 250 that is
 # already ~n·eps in the factors, so each is compared to a Float64 reference instead: the
 # explicit kernel must be as accurate as the generic one (within a factor 4 plus roundoff —
@@ -186,10 +187,13 @@ end
 wilkinson(n) = [i == j ? 1.0 : (j == n ? 1.0 : (i > j ? -1.0 : 0.0)) for i in 1:n, j in 1:n]
 relerr(a, b) = norm(a - b) / norm(b)
 function reduce_unblocked(J::AbstractMatrix{T}, generic::Bool) where {T}
-    A = copy(J)
-    ipiv = zeros(Int, max(size(A, 1) - 2, 0))
-    LHLFactorization._lhl_reduce_unblocked!(generic ? view(A, :, :) : A, ipiv)
-    return A, ipiv
+    n = size(J, 1)
+    ipiv = zeros(Int, max(n - 2, 0))
+    generic || return LHLFactorization._lhl_reduce_unblocked!(copy(J), ipiv), ipiv
+    P = zeros(T, 2n, n)
+    P[1:2:(2n), :] .= J
+    LHLFactorization._lhl_reduce_unblocked!(view(P, 1:2:(2n), 1:n), ipiv)
+    return P[1:2:(2n), :], ipiv
 end
 @testset "explicit-vector trailing update agrees with the generic one: $T" for T in (Float64, Float32)
     for n in vcat(1:40, [64, 100, 127, 128, 129, 200, 257, 300])

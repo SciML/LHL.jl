@@ -67,10 +67,14 @@ a column-major array the transposed layout turns every inner loop of the per-γ 
 (fused rebuild and elimination, back substitution) into a contiguous one; `rdiag` holds the
 reciprocals of the pivots of that LU.  `resid` doubles
 as scratch for the reduction and for `lhl_shift!`; `Ht` and `Gt` are scratch during the
-reduction, which fills `Ht` last.
+reduction, which fills `Ht` last.  `factors` is an `n×n` view into `fstore`, whose leading
+dimension is padded so that no small multiple of the column stride falls within a vector of
+a multiple of 4 KiB (the reduction's row-block sweep would otherwise stall on loads that
+alias its own stores a few columns back).
 """
 mutable struct LHLWorkspace{T, Tr}
-    factors::Matrix{T}
+    fstore::Matrix{T}
+    factors::SubArray{T, 2, Matrix{T}, Tuple{UnitRange{Int}, UnitRange{Int}}, false}
     Lp::Vector{T}
     ipiv::Vector{Int}
     scale::Vector{Tr}
@@ -90,8 +94,9 @@ end
 
 function LHLWorkspace{T}(n::Integer) where {T}
     Tr = real(T)
+    F = Matrix{T}(undef, _lhl_ld(n, T), n)
     return LHLWorkspace{T, Tr}(
-        Matrix{T}(undef, n, n), Vector{T}(undef, _lhl_lpack_len(n)),
+        F, view(F, 1:n, 1:n), Vector{T}(undef, _lhl_lpack_len(n)),
         Vector{Int}(undef, max(n - 2, 0)), ones(Tr, n),
         Matrix{T}(undef, n, n), Matrix{T}(undef, n, n), Vector{T}(undef, n),
         Vector{Bool}(undef, n), Vector{T}(undef, n), zero(T), zero(T), false, n, 0
@@ -102,9 +107,30 @@ end
 _lhl_loff(k::Int, n::Int) = (k - 1) * (n - 2) - ((k - 1) * (k - 2)) >> 1
 _lhl_lpack_len(n::Int) = n >= 3 ? _lhl_loff(n - 1, n) : 0
 
+# Leading dimension of `fstore`: columns 32-byte aligned, and no multiple m ≤ 8 of the
+# column stride within 128 bytes of a multiple of 4 KiB.  Below n = 64 the aliasing costs
+# nothing measurable.
+function _lhl_ld(n::Int, ::Type{T}) where {T}
+    n <= 64 && return n
+    sz = isbitstype(T) ? sizeof(T) : sizeof(Ptr{Cvoid})
+    W = max(32 ÷ sz, 1)
+    ld = W * cld(n, W) - W
+    ok = false
+    while !ok
+        ld += W
+        ok = true
+        for m in 1:8
+            r = (m * ld * sz) % 4096
+            ok &= min(r, 4096 - r) >= 128
+        end
+    end
+    return ld
+end
+
 function _lhl_resize!(ws::LHLWorkspace{T}, n::Int) where {T}
     n == ws.n && size(ws.factors, 1) == n && return ws
-    ws.factors = Matrix{T}(undef, n, n)
+    ws.fstore = Matrix{T}(undef, _lhl_ld(n, T), n)
+    ws.factors = view(ws.fstore, 1:n, 1:n)
     ws.Ht = Matrix{T}(undef, n, n)
     ws.Gt = Matrix{T}(undef, n, n)
     resize!(ws.Lp, _lhl_lpack_len(n))
@@ -125,7 +151,7 @@ end
 # Parlett–Reinsch scaling: equalize each row/column norm pair by a power of two, which is
 # exact in binary floating point and so costs no accuracy.
 function _lhl_balance!(A::AbstractMatrix{T}, d::AbstractVector) where {T}
-    n = size(A, 1)
+    n = size(A, 2)
     Tr = real(T)
     fill!(d, one(eltype(d)))
     for _ in 1:20
@@ -166,7 +192,8 @@ function _lhl_balance!(A::AbstractMatrix{T}, d::AbstractVector) where {T}
 end
 
 # ---------------------------------------------------------------------------
-# The reduction
+# The reduction.  The kernels reduce the leading n×n block of `A`, n = size(A, 2): `A` is
+# `fstore`, whose leading dimension may exceed n.
 # ---------------------------------------------------------------------------
 
 """
@@ -178,8 +205,16 @@ pivoting, into `ws`.  `J` is not modified.
 function lhl_reduce!(ws::LHLWorkspace{T}, J::AbstractMatrix, balance::Bool) where {T}
     n = LinearAlgebra.checksquare(J)
     _lhl_resize!(ws, n)
-    A = ws.factors
-    copyto!(A, J)
+    A = ws.fstore
+    if size(A, 1) == n
+        copyto!(A, J)
+    else
+        @inbounds for j in 1:n
+            @simd for i in 1:n
+                A[i, j] = J[i, j]
+            end
+        end
+    end
     if balance
         _lhl_balance!(A, ws.scale)
     else
@@ -206,7 +241,7 @@ function lhl_reduce!(ws::LHLWorkspace{T}, J::AbstractMatrix, balance::Bool) wher
 end
 
 function _lhl_reduce_unblocked!(A::AbstractMatrix{T}, ipiv) where {T}
-    n = size(A, 1)
+    n = size(A, 2)
     @inbounds for k in 1:(n - 2)
         p = k + 1
         amax = abs(A[k + 1, k])
@@ -286,10 +321,11 @@ end
 # the left update first.  Blocks are 4 vectors of W rows; the block straddling row k+1 and
 # the last < W rows (a vector overlapping already-finished rows) go through the masked
 # single-vector kernel, whose lanes select between the updated and the untouched value.
-function _lhl_trailing_update!(A::Matrix{T}, k::Int, n::Int) where {T <: Union{Float32, Float64}}
+function _lhl_trailing_update!(A::StridedMatrix{T}, k::Int, n::Int) where {T <: Union{Float32, Float64}}
     V = _lhl_vectype(T)
     W = _LHL_VEC_BYTES ÷ sizeof(T)
-    n < max(W, 8) && return invoke(_lhl_trailing_update!, Tuple{AbstractMatrix, Int, Int}, A, k, n)
+    (n < max(W, 8) || stride(A, 1) != 1) &&
+        return invoke(_lhl_trailing_update!, Tuple{AbstractMatrix, Int, Int}, A, k, n)
     GC.@preserve A begin
         pA = pointer(A)
         lds = stride(A, 2) * sizeof(T)
@@ -431,22 +467,19 @@ end
 # and applied in one column sweep at the end.
 # Below `_lhl_block_min` the panel bookkeeping costs more than the GEMM saves; a narrow
 # panel wins because the trailing GEMV that dominates is independent of `nb` while the
-# per-step panel work grows with it.  With the row-block trailing update the unblocked
-# reduction stays ahead up to n ≈ 384 (Float64) / 768 (Float32) on average, but it dips
-# well below the blocked one wherever a small multiple of the column stride is within a
-# vector of a multiple of 4 KiB (its stores and loads a few columns apart then alias in the
-# low address bits): the deep dips start at n ≈ 249 (Float64) and n ≈ 500 (Float32), and
-# the crossover sits just below them.
-_lhl_block_min(::Type{Float64}) = 248
-_lhl_block_min(::Type{Float32}) = 496
-_lhl_block_min(::Type{T}) where {T} = sizeof(real(T)) >= 8 ? 160 : 320
-_lhl_panel_width(n::Int) = n < 512 ? 12 : 16
+# per-step panel work grows with it.  With the row-block trailing update on the padded
+# `fstore` the unblocked reduction stays ahead up to n ≈ 530 (Float64) / 1000 (Float32),
+# and with the generic sweeps and GEMM (ComplexF64, ComplexF32) up to n ≈ 1100-1500.
+_lhl_block_min(::Type{Float64}) = 536
+_lhl_block_min(::Type{Float32}) = 1024
+_lhl_block_min(::Type{T}) where {T} = 1280
+_lhl_panel_width(n::Int) = 16
 
 function _lhl_reduce_blocked!(
         A::AbstractMatrix{T}, ipiv, B0::AbstractMatrix{T},
         w::AbstractVector{T}, pack::AbstractArray{T}, nb::Int
     ) where {T}
-    n = size(A, 1)
+    n = size(A, 2)
     @inbounds for k0 in 1:nb:(n - 2)
         kb = min(k0 + nb - 1, n - 2)
         for j in (k0 + 1):(kb + 1)
@@ -549,10 +582,7 @@ function _lhl_reduce_blocked!(
                 A[i, k + 1] += vj * A[i, j]
             end
         end
-        for kk in (kb + 2):nb:n
-            ke = min(kk + nb - 1, n)
-            _lhl_gemm!(A, 1, k0, kk, ke, kk, k0, k0 + 1, kb + 1, one(T), pack)
-        end
+        _lhl_top_gemm!(A, k0, kb, nb, pack)
     end
     @inbounds for k0 in 1:nb:(n - 2)
         kb = min(k0 + nb - 1, n - 2)
@@ -584,6 +614,56 @@ function _lhl_gemv_cols!(w, A::AbstractMatrix{T}, k::Int, r0::Int, r1::Int, c0::
         j += 1
     end
     return w
+end
+
+# The deferred right updates of rows 1:k0 of the panel columns:
+# A[1:k0, k0+1:kb+1] += A[1:k0, kb+2:n] * A[kb+2:n, k0:kb], one nb-wide K chunk at a time.
+function _lhl_top_gemm!(A::AbstractMatrix{T}, k0::Int, kb::Int, nb::Int, pack) where {T}
+    n = size(A, 2)
+    for kk in (kb + 2):nb:n
+        ke = min(kk + nb - 1, n)
+        _lhl_gemm!(A, 1, k0, kk, ke, kk, k0, k0 + 1, kb + 1, one(T), pack)
+    end
+    return nothing
+end
+
+# Same in K chunks of 64: with only nb output columns, packing the k0×K left operand would
+# cost as much as the product, so the tile reads it in place in row blocks small enough
+# that a block's chunk stays in L1/L2.
+function _lhl_top_gemm!(
+        A::StridedMatrix{T}, k0::Int, kb::Int, nb::Int, pack::Array{T}
+    ) where {T <: Union{Float32, Float64}}
+    n = size(A, 2)
+    (kb + 2 > n || k0 < 1) && return nothing
+    if stride(A, 1) != 1
+        return invoke(_lhl_top_gemm!, Tuple{AbstractMatrix{T}, Int, Int, Int, Any}, A, k0, kb, nb, pack)
+    end
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    mr = 3W
+    rowblock = 4mr
+    ld = stride(A, 2)
+    sz = sizeof(T)
+    GC.@preserve A begin
+        pA = pointer(A)
+        j = kb + 2
+        while j <= n
+            K = min(64, n - j + 1)
+            pP = pA + (j - 1) * ld * sz
+            pB = pA + (j - 1 - ld) * sz
+            ib = 1
+            while ib <= k0
+                ie = min(ib + rowblock - 1, k0)
+                rfull = ib + ((ie - ib + 1) ÷ mr) * mr - 1
+                ct = _lhl_micro_tile!(V, pA, ld, pP, ld, pB, ld, K, 1, ib, rfull, k0 + 1, kb + 1)
+                _lhl_micro_edge!(V, pA, ld, pP, ld, pB, ld, K, 1, rfull + 1, ie, k0 + 1, kb + 1)
+                _lhl_micro_edge!(V, pA, ld, pP, ld, pB, ld, K, 1, ib, rfull, ct, kb + 1)
+                ib = ie + 1
+            end
+            j += K
+        end
+    end
+    return nothing
 end
 
 # A[i0:i1, c0:c1] += sgn * A[i0:i1, j0:j1] * A[r0:r0+K-1, cB:cB+(c1-c0)],  K = j1 - j0 + 1.
@@ -788,7 +868,7 @@ function _lhl_gemm_micro!(
     V = _lhl_vectype(T)
     W = _LHL_VEC_BYTES ÷ sizeof(T)
     mr = 3W
-    rowblock = 96
+    rowblock = 384
     ld = stride(A, 2)
     sz = sizeof(T)
     GC.@preserve A pack begin
@@ -813,7 +893,7 @@ end
 # triangle of the panel's multipliers (M[i, k+1] = A[i, k] for i ≥ k+2, i.e. the panel's left
 # transforms restricted to its own rows).  Row k0+1 is unchanged.
 function _lhl_trsm_block!(A::AbstractMatrix{T}, k0::Int, kb::Int, pack) where {T}
-    n = size(A, 1)
+    n = size(A, 2)
     @inbounds for c in (kb + 2):n, k in k0:kb
         x = A[k + 1, c]
         iszero(x) && continue
@@ -830,7 +910,7 @@ end
 function _lhl_trsm_block!(
         A::StridedMatrix{T}, k0::Int, kb::Int, pack::Array{T}
     ) where {T <: Union{Float32, Float64}}
-    n = size(A, 1)
+    n = size(A, 2)
     nb = kb - k0 + 1
     ncol = n - kb - 1
     if stride(A, 1) != 1 || nb < 2 || length(pack) < nb * nb + nb * ncol

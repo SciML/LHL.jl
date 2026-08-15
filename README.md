@@ -101,7 +101,7 @@ Measured against LAPACK on one thread, a new shift is 25× cheaper than a refact
 LU's triangular solves do (0.6× at `n ≤ 64`, 1.0–1.2× at `n = 256–2000`), so the trade
 pays whenever a factorization serves more than a handful of shifts.
 
-The reduction is unblocked below `n ≈ 250` (Float64; 500 for Float32) and blocked above:
+The reduction is unblocked below `n ≈ 530` (Float64; 1000 for Float32) and blocked above:
 delayed panel updates with rank-`nb` GEMMs in a register-blocked pure-Julia microkernel, no
 BLAS. On one thread it runs at 1× a LAPACK LU for `n ≤ 64`, 3× at `n = 256`, 4× at
 `n = 1024` and 7–8× at `n = 2000`, where the trailing GEMV that dominates it is DRAM-bound.
