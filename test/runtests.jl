@@ -66,7 +66,7 @@ end
         copyto!(wb.factors, J)
         balance ? LHL._lhl_balance!(wb.factors, wb.scale, wb.iscale) : fill!(wb.scale, 1)
         wu = deepcopy(wb)
-        LHL._lhl_reduce_blocked!(wb.factors, wb.ipiv, wb.Ht, wb.resid, wb.Gt, LHL._lhl_panel_width(n))
+        LHL._lhl_reduce_blocked!(wb.factors, wb.ipiv, wb.Ht, wb.work, wb.pack, LHL._lhl_panel_width(n))
         LHL._lhl_reduce_unblocked!(wu.factors, wu.ipiv)
         return wb, wu
     end
@@ -113,13 +113,14 @@ end
 end
 
 # The shift as it was before the fused-row pass: one elimination step per pass over the
-# pending row.  The fused kernel must reproduce it bit for bit — same pivots, same rounding —
-# on random matrices and on ones full of exact ties and zero pivots.
-function _lhl_shift_ref!(ws::LHLWorkspace{T}, σ, τ) where {T}
-    Ht, Gt, swap, r, n = ws.Ht, ws.Gt, ws.swap, ws.resid, ws.n
+# pending row, on a plain n×n `Gt`.  The fused kernel and the planar complex storage must
+# reproduce it bit for bit — same pivots, same rounding — on random matrices and on ones full
+# of exact ties and zero pivots.
+function _lhl_shift_ref!(Gt::Matrix{T}, swap, rdiag, Ht, σ, τ) where {T}
+    n = size(Gt, 1)
+    r = Vector{T}(undef, n)
     σ = convert(T, σ)
     τ = convert(T, τ)
-    n == 0 && return ws
     @inbounds begin
         @simd for j in 1:n
             r[j] = τ * Ht[j, 1]
@@ -129,7 +130,7 @@ function _lhl_shift_ref!(ws::LHLWorkspace{T}, σ, τ) where {T}
         for k in 1:(n - 1)
             a = r[k]
             b = τ * Ht[k, k + 1]
-            if abs(b) > abs(a)
+            if LHLFactorization._lhl_pivmag(b) > LHLFactorization._lhl_pivmag(a)
                 swap[k] = true
                 Gt[k, k] = b
                 l = a / b
@@ -162,46 +163,70 @@ function _lhl_shift_ref!(ws::LHLWorkspace{T}, σ, τ) where {T}
         Gt[n, n] = r[n]
         swap[n] = false
         iszero(Gt[n, n]) && info == 0 && (info = n)
-        rd = ws.rdiag
         @simd for j in 1:n
-            rd[j] = inv(Gt[j, j])
+            rdiag[j] = inv(Gt[j, j])
         end
     end
-    ws.info = info
-    return ws
+    return info
 end
 # Everything the solve reads: U (Gt[j, k], j ≥ k), the multipliers Gt[k, k+1], swap, rdiag, info.
-function shift_state(ws)
-    n = ws.n
-    U = [ws.Gt[j, k] for k in 1:n for j in k:n]
-    l = [ws.Gt[k, k + 1] for k in 1:(n - 1)]
-    return (U, l, copy(ws.swap), copy(ws.rdiag), ws.info)
+function ref_state(Ht::AbstractMatrix, ::Type{T}, σ, τ) where {T}
+    n = size(Ht, 1)
+    Gt = zeros(T, n, n)
+    swap = Vector{Bool}(undef, n)
+    rdiag = Vector{T}(undef, n)
+    info = _lhl_shift_ref!(Gt, swap, rdiag, Ht, σ, τ)
+    U = [Gt[j, k] for k in 1:n for j in k:n]
+    l = [Gt[k, k + 1] for k in 1:(n - 1)]
+    return (U, l, swap, rdiag, info)
+end
+function shift_state(sh::LHLShift{TG}) where {TG}
+    n = sh.n
+    gt(j, k) = LHLFactorization._lhl_get(TG, sh.Gt, sh.po, j, k)
+    U = [gt(j, k) for k in 1:n for j in k:n]
+    l = [gt(k, k + 1) for k in 1:(n - 1)]
+    return (U, l, copy(sh.swap), copy(sh.rdiag), sh.info)
 end
 same_state(a, b) = all(x === y for (u, v) in zip(a, b) for (x, y) in zip(u, v))
 tie_matrix(rng, T, n) = T.(rand(rng, -2:2, n, n))
 @testset "shift matches the reference implementation: $T" for T in (Float64, Float32, ComplexF64)
     rng = MersenneTwister(31)
-    ns = T <: Real ? vcat(1:300, [511, 512, 513, 520, 640, 768, 1000, 1024]) : 1:120
+    ns = T <: Real ? vcat(1:300, [511, 512, 513, 520, 640, 768, 1000, 1024]) : vcat(1:120, [511, 512, 520])
     for n in ns, tie in (false, true)
         J = tie ? tie_matrix(rng, T, n) : randn(rng, T, n, n)
         ws = lhl(J)
-        wr = deepcopy(ws)
         for (σ, τ) in ((1, -0.1), (0, 1), (1, -3), (2, 0), (0, 0))
-            _lhl_shift_ref!(wr, σ, τ)
             lhl_shift!(ws, σ, τ)
-            @test same_state(shift_state(wr), shift_state(ws))
+            @test same_state(ref_state(ws.Ht, T, σ, τ), shift_state(ws.shift))
         end
     end
     # the fused kernels below their size threshold, all row counts, plus the tie/zero cases
-    if T <: Real
-        for n in 1:80, tie in (false, true), R in (1, 2, 3, 4)
-            J = tie ? tie_matrix(rng, T, n) : randn(rng, T, n, n)
-            ws = lhl(J)
-            wr = deepcopy(ws)
-            for (σ, τ) in ((1, -0.1), (0, 1), (2, 0))
-                _lhl_shift_ref!(wr, σ, τ)
-                ws.info = LHLFactorization._lhl_shift_fused!(Val(R), ws, T(σ), T(τ))
-                @test same_state(shift_state(wr), shift_state(ws))
+    for n in 1:80, tie in (false, true), R in (1, 2, 3, 4)
+        J = tie ? tie_matrix(rng, T, n) : randn(rng, T, n, n)
+        ws = lhl(J)
+        for (σ, τ) in ((1, -0.1), (0, 1), (2, 0))
+            ws.info = LHLFactorization._lhl_shift_fused!(Val(R), ws.shift, ws, T(σ), T(τ))
+            @test same_state(ref_state(ws.Ht, T, σ, τ), shift_state(ws.shift))
+        end
+    end
+end
+
+# A complex shift on a real reduction: `Gt` is planar, `Ht` real.  Against the reference
+# on the same real `Ht` promoted to complex, bit for bit.
+@testset "complex shift on a real reduction matches the reference" begin
+    rng = MersenneTwister(32)
+    for n in vcat(1:100, [255, 256, 511, 512, 520, 700]), tie in (false, true)
+        J = tie ? tie_matrix(rng, Float64, n) : randn(rng, n, n)
+        ws = lhl(J; shift = ComplexF64)
+        for (σ, τ) in ((0.4 + 0.7im, -1), (1, -0.1 + 0.2im), (0, 1im), (2im, 0), (0, 0))
+            lhl_shift!(ws, σ, τ)
+            @test same_state(ref_state(ws.Ht, ComplexF64, σ, τ), shift_state(ws.shift))
+        end
+        if n <= 80
+            for R in (1, 2, 3, 4)
+                σ, τ = 0.4 + 0.7im, -1.0 + 0im
+                ws.info = LHLFactorization._lhl_shift_fused!(Val(R), ws.shift, ws, σ, τ)
+                @test same_state(ref_state(ws.Ht, ComplexF64, σ, τ), shift_state(ws.shift))
             end
         end
     end
@@ -221,6 +246,92 @@ end
     ws = lhl(J)
     lhl_shift!(ws, 1, -γ)
     @test lhl_ldiv!(copy(b), ws) ≈ Matrix(I - γ * J) \ b rtol = 1.0e-9
+end
+
+@testset "complex shifts on a real reduction" begin
+    setprecision(BigFloat, 128) do
+        for n in (1, 2, 3, 5, 40, 129, 260, 600)
+            J = randn(MersenneTwister(n), n, n)
+            b = randn(MersenneTwister(n + 7), ComplexF64, n)
+            ws = lhl(J; shift = ComplexF64)
+            @test ws isa LHLWorkspace{Float64, Float64, ComplexF64}
+            wf = lhl(complex.(J))
+            for (σ, τ) in ((0.4 + 0.7im, -1.0), (1.0, -0.05 + 0.3im), (0.0, 1im), (-3.0 + 2im, 2.0 - 1im), (1.0, -0.05))
+                W = σ * I + τ * J
+                lhl_shift!(ws, σ, τ)
+                x = lhl_ldiv!(copy(b), ws)
+                @test x ≈ Matrix(W) \ b rtol = 1.0e-9
+                lhl_shift!(wf, σ, τ)
+                xf = lhl_ldiv!(copy(b), wf)
+                @test x ≈ xf rtol = 1.0e-9
+                # forward errors of the real and the complex reduction are comparable (measured
+                # 0.5–3× of each other on these matrices)
+                if n <= 129
+                    xref = (big(σ) * I + big(τ) * big.(J)) \ big.(b)
+                    err(v) = Float64(norm(v - xref) / norm(xref))
+                    @test err(x) <= 10 * err(xf) + 100 * eps()
+                end
+                # refinement with the complex system matrix
+                y = lhl_refine!(copy(x), Matrix(W), b, ws, 1)
+                @test bwd(Matrix(W), y, b) <= 2 * bwd(Matrix(W), x, b) + eps()
+                @test bwd(Matrix(W), y, b) < 50 * eps()
+            end
+        end
+    end
+    # a resolvent sweep, (sI - A)⁻¹b over a set of s
+    n = 80
+    A = randn(MersenneTwister(80), n, n)
+    b = randn(MersenneTwister(81), ComplexF64, n)
+    ws = lhl(A; shift = ComplexF64)
+    for s in (0.1 + 1im, 2.0 - 3im, 1im, -0.5 + 0.01im)
+        lhl_shift!(ws, s, -1)
+        @test lhl_ldiv!(copy(b), ws) ≈ (s * I - A) \ b rtol = 1.0e-9
+    end
+    # Radau-like use: a real and a complex shift held together against one reduction
+    J = randn(MersenneTwister(90), n, n)
+    br = randn(MersenneTwister(91), n)
+    bc = randn(MersenneTwister(92), ComplexF64, n)
+    ws = lhl(J)
+    sh = LHLShift{ComplexF64}(ws)
+    @test sh isa LHLShift{ComplexF64, Float64}
+    for (γ, γc) in ((0.1, 0.05 + 0.1im), (0.2, 0.1 - 0.3im))
+        lhl_shift!(ws, 1, -γ)
+        lhl_shift!(sh, ws, 1, -γc)
+        @test lhl_ldiv!(copy(br), ws) ≈ (I - γ * J) \ br rtol = 1.0e-9
+        @test lhl_ldiv!(copy(bc), sh, ws) ≈ (I - γc * J) \ bc rtol = 1.0e-9
+        @test lhl_ldiv!(copy(bc), ws) ≈ (I - γ * J) \ bc rtol = 1.0e-9    # complex rhs, real shift
+        @test lhl_refine!(lhl_ldiv!(copy(bc), sh, ws), I - γc * J, bc, sh, ws, 1) ≈ (I - γc * J) \ bc rtol = 1.0e-12
+        @test ws.info == 0 && sh.info == 0 && sh.σ == 1 && sh.τ == -γc
+    end
+    # the shift resizes with the workspace
+    J2 = randn(MersenneTwister(93), 2n, 2n)
+    b2 = randn(MersenneTwister(94), ComplexF64, 2n)
+    lhl!(ws, J2)
+    lhl_shift!(sh, ws, 1, -0.3im)
+    @test lhl_ldiv!(copy(b2), sh, ws) ≈ (I - 0.3im * J2) \ b2 rtol = 1.0e-9
+    # a real x cannot receive a complex solution; a real shift state cannot take a complex shift
+    @test_throws ArgumentError lhl_ldiv!(randn(2n), sh, ws)
+    @test_throws ArgumentError lhl_shift!(ws, 1, -0.3im)
+    @test_throws ArgumentError lhl_shift!(LHLShift{ComplexF64}(3), lhl(randn(Float32, 3, 3)), 1, 1)
+    @test_throws ArgumentError LHLWorkspace{Float64}(3; shift = Float32)
+    @test_throws DimensionMismatch lhl_ldiv!(copy(b2), LHLShift{ComplexF64}(n), ws)
+    lhl_shift!(ws, 1 + 0im, -0.3 + 0im)         # complex with zero imaginary parts is fine
+    @test lhl_ldiv!(copy(b2), ws) ≈ (I - 0.3 * J2) \ b2 rtol = 1.0e-9
+    # singular complex shift is reported
+    wd = lhl([1.0 0.0; 0.0 2.0]; shift = ComplexF64)
+    lhl_shift!(wd, -1im, 1im)                   # i(J - I)
+    @test wd.info != 0
+    # Float32 and a generic element type
+    J32 = randn(MersenneTwister(95), Float32, 70, 70)
+    b32 = randn(MersenneTwister(96), ComplexF32, 70)
+    w32 = lhl(J32; shift = ComplexF32)
+    lhl_shift!(w32, 0.4f0 + 0.7f0im, -1)
+    @test lhl_ldiv!(copy(b32), w32) ≈ ((0.4f0 + 0.7f0im) * I - J32) \ b32 rtol = 1.0e-3
+    Jb = big.(randn(MersenneTwister(97), 20, 20))
+    bb = Complex{BigFloat}.(randn(MersenneTwister(98), ComplexF64, 20))
+    wb = lhl(Jb; shift = Complex{BigFloat})
+    lhl_shift!(wb, 0.4 + 0.7im, -1)
+    @test lhl_ldiv!(copy(bb), wb) ≈ ((0.4 + 0.7im) * I - Jb) \ bb rtol = 1.0e-9
 end
 
 @testset "pivoting is what makes it work" begin
@@ -282,6 +393,29 @@ end
         wsm = lhl(randn(MersenneTwister(m), T, m, m))
         lhl_shift!(wsm, 1, -0.3)
         @test @allocated(lhl_shift!(wsm, 1, -0.4)) == 0
+    end
+    for m in (64, 520)   # complex shift on a real reduction, built in and held separately
+        Jm = randn(MersenneTwister(m), m, m)
+        wc = lhl(Jm; shift = ComplexF64)
+        sh = LHLShift{ComplexF64}(wc)
+        Wc = (0.4 + 0.7im) * I - Jm
+        xc = randn(MersenneTwister(m + 1), ComplexF64, m)
+        bc = copy(xc)
+        lhl_shift!(wc, 0.4 + 0.7im, -1)
+        lhl_shift!(sh, wc, 0.4 + 0.7im, -1)
+        lhl_ldiv!(xc, wc)
+        lhl_ldiv!(xc, sh, wc)
+        lhl_refine!(xc, Wc, bc, wc, 1)
+        lhl_refine!(xc, Wc, bc, sh, wc, 1)
+        sc = randn(MersenneTwister(m + 2), ComplexF64)   # a runtime value, not a constant-folded literal
+        @test @allocated(lhl_shift!(wc, sc, -1)) == 0
+        @test @allocated(lhl_shift!(sh, wc, sc, -1)) == 0
+        @test @allocated(lhl_shift!(wc, sc, 1 - sc)) == 0
+        @test @allocated(lhl_ldiv!(xc, wc)) == 0
+        @test @allocated(lhl_ldiv!(xc, sh, wc)) == 0
+        @test @allocated(lhl_refine!(xc, Wc, bc, wc, 1)) == 0
+        @test @allocated(lhl_refine!(xc, Wc, bc, sh, wc, 1)) == 0
+        @test @allocated(lhl!(wc, Jm)) == 0
     end
 end
 
