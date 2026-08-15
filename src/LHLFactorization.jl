@@ -74,7 +74,9 @@ mutable struct LHLWorkspace{T, Tr}
     resid::Vector{T}
     σ::T
     τ::T
-    jac_version::Int
+    # Whether `factors` holds a valid reduction. A consumer tracking *whose* Jacobian it
+    # is must do so itself; this only says one was computed.
+    reduced::Bool
     n::Int
     info::Int
 end
@@ -84,7 +86,7 @@ function LHLWorkspace{T}(n::Integer) where {T}
     return LHLWorkspace{T, Tr}(
         Matrix{T}(undef, n, n), Vector{Int}(undef, max(n - 2, 0)), ones(Tr, n),
         Matrix{T}(undef, n, n), Matrix{T}(undef, n, n), Vector{Bool}(undef, n),
-        Vector{T}(undef, n), zero(T), zero(T), -1, n, 0
+        Vector{T}(undef, n), zero(T), zero(T), false, n, 0
     )
 end
 
@@ -98,7 +100,7 @@ function _lhl_resize!(ws::LHLWorkspace{T}, n::Int) where {T}
     resize!(ws.swap, n)
     resize!(ws.resid, n)
     ws.n = n
-    ws.jac_version = -1
+    ws.reduced = false
     return ws
 end
 
@@ -224,7 +226,7 @@ function lhl_reduce!(ws::LHLWorkspace{T}, J::AbstractMatrix, balance::Bool) wher
     @inbounds for j in 1:n, i in 1:min(j + 1, n)
         Ht[j, i] = A[i, j]
     end
-    ws.jac_version = -1
+    ws.reduced = true
     return ws
 end
 
