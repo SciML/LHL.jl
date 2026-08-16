@@ -18,14 +18,22 @@ concurrency:
 
 jobs:
   tests:
-    name: "Julia ${{ matrix.version }}"
+    name: "${{ matrix.group }} - Julia ${{ matrix.version }}"
     strategy:
       fail-fast: false
+      # The version list per group is mirrored in test/test_groups.toml.
       matrix:
+        group: ['Core', 'Interface', 'QA']
         version: ['lts', '1', 'pre']
+        exclude:
+          - group: 'Interface'
+            version: 'pre'
+          - group: 'QA'
+            version: 'pre'
     uses: "SciML/.github/.github/workflows/tests.yml@v1"
     with:
       julia-version: "${{ matrix.version }}"
+      group: "${{ matrix.group }}"
       num-threads: "4"
       coverage: true
     secrets: "inherit"

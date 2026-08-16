@@ -3150,12 +3150,11 @@ end
 
 """
     lhl(J; balance = true, shift = eltype(J), thread = Val(true)) -> LHLWorkspace
-    lhl!(ws, J; balance = true, thread = Val(true)) -> LHLWorkspace
 
 Reduce `J` to upper Hessenberg form by Gaussian similarity with partial pivoting.  `J` is
-not modified.  `lhl!` reuses an existing workspace, resizing it if needed.  `shift` is the
-element type of the shifts and solves; `Complex{eltype(J)}` on a real `J` keeps the
-reduction real and makes only the shifted half complex (see [`LHLShift`](@ref)).
+not modified; [`lhl!`](@ref) reuses an existing workspace instead of allocating one.
+`shift` is the element type of the shifts and solves; `Complex{eltype(J)}` on a real `J`
+keeps the reduction real and makes only the shifted half complex (see [`LHLShift`](@ref)).
 
 `thread = Val(true)` lets the blocked reduction (`n ≥ 500` for `Float64`, `1024` for
 `Float32`; other element types stay serial) run on Polyester threads; threading requires
@@ -3174,6 +3173,13 @@ function lhl(J::AbstractMatrix; balance::Bool = true, shift::Type = eltype(J), t
     return ws
 end
 
+"""
+    lhl!(ws, J; balance = true, thread = Val(true)) -> ws
+
+Reduce `J` into the existing workspace `ws`, resizing it if needed, and return `ws`.  `J`
+is not modified.  The in-place counterpart of [`lhl`](@ref), which documents `balance` and
+`thread`; the shift element type is fixed when `ws` is built and is not a keyword here.
+"""
 function lhl!(ws::LHLWorkspace, J::AbstractMatrix; balance::Bool = true, thread = Val(true))
     lhl_reduce!(ws, J, balance, thread)
     return ws

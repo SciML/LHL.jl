@@ -1,9 +1,11 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Polyester = "f517fe37-dbe3-4b94-8317-1923a5111588"
 LHLFactorization = "2faa5264-e118-4071-8864-e10559f68c7c"
 
 [compat]
 Documenter = "1"
 LinearAlgebra = "1.10"
+Polyester = "0.7"
 LHLFactorization = "1"
