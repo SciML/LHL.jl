@@ -49,8 +49,8 @@ error comparable to LU's even on the near-nilpotent matrices where `κ(Z)` reach
 """
 module LHLFactorization
 
-using LinearAlgebra
-using LinearAlgebra: BlasInt, checksquare
+import LinearAlgebra
+using LinearAlgebra: checksquare, mul!
 
 export LHLWorkspace, LHLShift, lhl, lhl!, lhl_reduce!, lhl_shift!, lhl_ldiv!, lhl_refine!,
     applyZ!, applyZinv!
@@ -566,12 +566,16 @@ function _lhl_trailing_update!(A::StridedMatrix{T}, k::Int, n::Int) where {T <: 
     return A
 end
 
-@inline _lhl_vneg(a::V) where {W, T, V <: NTuple{W, VecElement{T}}} =
-    ntuple(w -> VecElement(-a[w].value), Val(W))
-@inline _lhl_vadd(a::V, b::V) where {W, T, V <: NTuple{W, VecElement{T}}} =
-    ntuple(w -> VecElement(a[w].value + b[w].value), Val(W))
-@inline _lhl_vselect(m::NTuple{W, Bool}, a::V, b::V) where {W, T, V <: NTuple{W, VecElement{T}}} =
-    ntuple(w -> VecElement(ifelse(m[w], a[w].value, b[w].value)), Val(W))
+# `NTuple{W, VecElement{T}}` admits the empty tuple, which leaves `T` free (Aqua's
+# unbound-type-parameter check); spelling out the first lane pins both parameters.
+const _LHLVec{T, W} = Tuple{VecElement{T}, Vararg{VecElement{T}, W}}
+
+@inline _lhl_vneg(a::_LHLVec{T, W}) where {T, W} =
+    ntuple(w -> VecElement(-a[w].value), Val(W + 1))
+@inline _lhl_vadd(a::_LHLVec{T, W}, b::_LHLVec{T, W}) where {T, W} =
+    ntuple(w -> VecElement(a[w].value + b[w].value), Val(W + 1))
+@inline _lhl_vselect(m::Tuple{Bool, Vararg{Bool, W}}, a::_LHLVec{T, W}, b::_LHLVec{T, W}) where {T, W} =
+    ntuple(w -> VecElement(ifelse(m[w], a[w].value, b[w].value)), Val(W + 1))
 @inline _lhl_lanemask(::Val{W}, i0::Int, lo::Int) where {W} = ntuple(w -> i0 + w - 1 >= lo, Val(W))
 
 # Whole blocks of rows ia:ib, all with (L = true) or all without the left update; returns
@@ -2659,6 +2663,11 @@ end
     end
 end
 
+# `Base.setindex(::Tuple, v, i)` is not public API.  The result must keep its `NTuple{R}`
+# type so the `@generated` pass above still specializes on it.
+@inline _lhl_setindex(t::Tuple{Vararg{Any, N}}, v, i::Int) where {N} =
+    ntuple(j -> ifelse(j == i, v, t[j]), Val(N))
+
 @inline function _lhl_shift_block!(
         ::Val{R}, Ht, Gt, swap, r, o::Int, n::Int, σ::T, τ::T, k::Int, info::Int
     ) where {R, T}
@@ -2699,8 +2708,8 @@ end
                 swap[j] = s
                 _lhl_set!(T, Gt, o, j, j, ifelse(s, b, rj))
                 _lhl_set!(T, Gt, o, j, j + 1, l)
-                S = Base.setindex(S, s, m + 1)
-                L = Base.setindex(L, l, m + 1)
+                S = _lhl_setindex(S, s, m + 1)
+                L = _lhl_setindex(L, l, m + 1)
             end
         end
         _lhl_shift_pass!(S, L, Ht, Gt, r, o, n, τ, k, k + R + 1)
@@ -3029,7 +3038,7 @@ function _hessenberg_solve_buf!(y::Vector{T}, sh::LHLShift{T, T}) where {T <: Un
     return y
 end
 
-@inline _lhl_vsum(v::NTuple{W, VecElement{T}}) where {W, T} = sum(ntuple(w -> v[w].value, Val(W)))
+@inline _lhl_vsum(v::_LHLVec{T, W}) where {T, W} = sum(ntuple(w -> v[w].value, Val(W + 1)))
 
 """
     lhl_ldiv!(x, ws)
