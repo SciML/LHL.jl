@@ -3,11 +3,6 @@ on:
   issue_comment:
     types: [created]
   workflow_dispatch:
-    inputs:
-      package:
-        description: "Package name to tag; empty audits every package"
-        required: false
-        type: string
 permissions:
   actions: read
   checks: read
@@ -24,7 +19,5 @@ permissions:
 
 jobs:
   tagbot:
-    uses: "SciML/.github/.github/workflows/monorepo-tagbot.yml@v1"
-    with:
-      package: "${{ inputs.package }}"
+    uses: "SciML/.github/.github/workflows/tagbot.yml@v1"
     secrets: "inherit"
