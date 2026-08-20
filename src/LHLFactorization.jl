@@ -3218,4 +3218,20 @@ if ccall(:jl_generating_output, Cint, ()) == 1
     end
 end
 
+using PrecompileTools: @compile_workload, @setup_workload
+
+@setup_workload begin
+    @compile_workload begin
+        J = [1.0 0.2 0.0 0.0; 0.0 2.0 0.3 0.0; 0.0 0.0 3.0 0.4; 0.1 0.0 0.0 4.0]
+        ws = lhl(J; thread = Val(false))
+        lhl_shift!(ws, 1.0, -0.1)
+        b = ones(4)
+        x = lhl_ldiv!(copy(b), ws)
+        lhl_refine!(x, Matrix{Float64}(LinearAlgebra.I, 4, 4) - 0.1 * J, b, ws, 1)
+        sh = LHLShift{ComplexF64}(ws)
+        lhl_shift!(sh, ws, 1.0, 0.1im)
+        lhl_ldiv!(ComplexF64.(b), sh, ws)
+    end
+end
+
 end # module
