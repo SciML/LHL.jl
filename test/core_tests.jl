@@ -35,6 +35,79 @@ end
     end
 end
 
+
+@testset "adjoint solves reuse the reduction" begin
+    # tie-heavy matrices exercise the interchange branches; the cond guard keeps the
+    # rtol-1e-9 comparison meaningful when a tie shift lands near singular
+    for n in (1, 2, 3, 5, 40, 129, 256, 600), balance in (true, false), tie in (false, true)
+        rng = MersenneTwister(97n + 2tie + balance)
+        J = tie ? Float64.(rand(rng, -2:2, n, n)) : randn(rng, n, n)
+        b = randn(rng, n)
+        ws = lhl(J; balance)
+        for (σ, τ) in ((1.0, -0.05), (-3.0, 2.0))
+            W = Matrix(σ * I + τ * J)
+            lhl_shift!(ws, σ, τ)
+            (ws.info == 0 && cond(W, 1) < 1.0e6) || continue
+            @test lhl_ldivH!(copy(b), ws) ≈ W' \ b rtol = 1.0e-9
+            @test lhl_ldivH!(view(copy(b), :), ws) ≈ W' \ b rtol = 1.0e-9
+            @test lhl_ldivH!(complex.(b), ws) ≈ W' \ b rtol = 1.0e-9
+        end
+        wc = lhl(J; balance, shift = ComplexF64)
+        bc = randn(rng, ComplexF64, n)
+        for (σ, τ) in ((0.4 + 0.7im, -1.0), (1.0, -0.05 + 0.3im))
+            W = Matrix(σ * I + τ * J)
+            lhl_shift!(wc, σ, τ)
+            (wc.info == 0 && cond(W, 1) < 1.0e6) || continue
+            @test lhl_ldivH!(copy(bc), wc) ≈ W' \ bc rtol = 1.0e-9
+        end
+        if !tie
+            Jc = randn(rng, ComplexF64, n, n)
+            wz = lhl(Jc; balance)
+            γ = 0.2 + 0.3im
+            lhl_shift!(wz, 1, -γ)
+            W = Matrix(I - γ * Jc)
+            if wz.info == 0 && cond(W, 1) < 1.0e6
+                @test lhl_ldivH!(copy(bc), wz) ≈ W' \ bc rtol = 1.0e-9
+            end
+        end
+    end
+    ws = lhl(randn(MersenneTwister(44), 8, 8))
+    lhl_shift!(ws, 1, -0.1)
+    sh = LHLShift{ComplexF64}(ws)
+    lhl_shift!(sh, ws, 1, -0.1 + 0.2im)
+    @test_throws DimensionMismatch lhl_ldivH!(zeros(9), ws)
+    @test_throws DimensionMismatch applyZH!(zeros(7), ws)
+    @test_throws DimensionMismatch applyZinvH!(zeros(9), ws)
+    @test_throws DimensionMismatch lhl_ldivH!(zeros(ComplexF64, 3), LHLShift{ComplexF64}(3), ws)
+    @test_throws ArgumentError lhl_ldivH!(zeros(8), sh, ws)
+end
+
+@testset "applyZH!/applyZinvH! against the dense Z: $T" for T in (Float64, Float32, ComplexF64)
+    # 725 puts the Float64 packed multipliers above the 2 MiB tiling limit
+    for n in (1, 2, 3, 5, 40, 129, 256, 600, 725)
+        J = randn(MersenneTwister(n), T, n, n)
+        ws = lhl(J)
+        Z = Matrix{T}(I, n, n)
+        for j in 1:n
+            applyZ!(view(Z, :, j), ws)
+        end
+        v = randn(MersenneTwister(n + 3), T, n)
+        rt = 200 * n * eps(real(T))
+        @test applyZH!(copy(v), ws) ≈ Z' * v rtol = rt
+        # the inverse comparisons carry κ(Z); skip when that drowns the precision
+        ti = 500 * cond(Z, 1) * n * eps(real(T))
+        if ti < 1.0e-2
+            @test applyZinvH!(copy(v), ws) ≈ Matrix(Z') \ v rtol = ti
+            @test applyZH!(applyZinvH!(copy(v), ws), ws) ≈ v rtol = ti
+        end
+        # the generic in-place path (eltype ≠ T) must agree with the packed one
+        if T <: Real
+            @test applyZH!(complex.(v), ws) ≈ applyZH!(copy(v), ws) rtol = rt
+            @test applyZinvH!(complex.(v), ws) ≈ applyZinvH!(copy(v), ws) rtol = rt
+        end
+    end
+end
+
 @testset "explicit-vector solve kernels agree with the generic ones" begin
     # 725 (Float64) and 1030 (both) put the packed multipliers above the 2 MiB tiling limit
     for T in (Float64, Float32), n in (3, 7, 33, 130, 331, 500, 725, 1030)
@@ -379,6 +452,29 @@ end
     @test bwd(W, refined, b) < 1.0e-13
 end
 
+
+@testset "adjoint refinement reduces the residual" begin
+    n = 60
+    J = triu(randn(MersenneTwister(17), n, n), 1)
+    J[n, 1] = 1.0e-8
+    b = randn(MersenneTwister(18), n)
+    γ = 0.5
+    W = Matrix(I - γ * J)
+    ws = lhl(J)
+    lhl_shift!(ws, 1, -γ)
+    raw = lhl_ldivH!(copy(b), ws)
+    refined = lhl_refineH!(copy(raw), W, b, ws, 1)
+    @test bwd(W', refined, b) <= bwd(W', raw, b)
+    @test bwd(W', refined, b) < 1.0e-13
+    γc = 0.1 - 0.3im
+    sh = LHLShift{ComplexF64}(ws)
+    lhl_shift!(sh, ws, 1, -γc)
+    Wc = Matrix(I - γc * J)
+    bc = randn(MersenneTwister(19), ComplexF64, n)
+    xc = lhl_ldivH!(copy(bc), sh, ws)
+    @test bwd(Wc', lhl_refineH!(copy(xc), Wc, bc, sh, ws, 1), bc) < 50 * eps()
+end
+
 @testset "allocation-free once the workspace exists" begin
     n = 64
     J = randn(MersenneTwister(21), n, n)
@@ -416,6 +512,31 @@ end
         @test @allocated(lhl_refine!(xc, Wc, bc, wc, 1)) == 0
         @test @allocated(lhl_refine!(xc, Wc, bc, sh, wc, 1)) == 0
         @test @allocated(lhl!(wc, Jm)) == 0
+    end
+    for m in (64, 520)   # adjoint entry points, real and complex shift, runtime values
+        Jm = randn(MersenneTwister(m + 5), m, m)
+        wr = lhl(Jm)
+        g = rand(MersenneTwister(m + 6))
+        lhl_shift!(wr, 1, -g)
+        Wr = Matrix(I - g * Jm)
+        br = randn(MersenneTwister(m + 7), m)
+        xr = copy(br)
+        lhl_ldivH!(xr, wr); applyZH!(xr, wr); applyZinvH!(xr, wr)
+        lhl_refineH!(xr, Wr, br, wr, 1)
+        @test @allocated(lhl_ldivH!(xr, wr)) == 0
+        @test @allocated(applyZH!(xr, wr)) == 0
+        @test @allocated(applyZinvH!(xr, wr)) == 0
+        @test @allocated(lhl_refineH!(xr, Wr, br, wr, 1)) == 0
+        shc = LHLShift{ComplexF64}(wr)
+        gc = rand(MersenneTwister(m + 8), ComplexF64)
+        lhl_shift!(shc, wr, 1, -gc)
+        Wc2 = Matrix(I - gc * Jm)
+        bc2 = randn(MersenneTwister(m + 9), ComplexF64, m)
+        xc2 = copy(bc2)
+        lhl_ldivH!(xc2, shc, wr)
+        lhl_refineH!(xc2, Wc2, bc2, shc, wr, 1)
+        @test @allocated(lhl_ldivH!(xc2, shc, wr)) == 0
+        @test @allocated(lhl_refineH!(xc2, Wc2, bc2, shc, wr, 1)) == 0
     end
 end
 

@@ -1,5 +1,16 @@
 # Release Notes
 
+## Unreleased
+
+### Added
+
+  - **Adjoint solves from the existing reduction**: `lhl_ldivH!` solves `Wᴴ x = b`
+    against the same reduction and the same shift LU as `lhl_ldiv!`
+    (`Wᴴ = Z⁻ᴴ Gᴴ Zᴴ` — three `O(n²)` phases, no refactorization), with `lhl_refineH!`
+    for iterative refinement against `Aᴴ` and `applyZH!`/`applyZinvH!` for the adjoint
+    similarity transformations. A complex shift on a real reduction conjugates only the
+    shifted half: `Zᴴ = Zᵀ` stays real.
+
 ## v2.0
 
 Breaking. The changes below are mechanical to adopt; `lhl`, `lhl!`, `lhl_reduce!`,

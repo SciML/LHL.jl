@@ -53,7 +53,7 @@ import LinearAlgebra
 using LinearAlgebra: checksquare, mul!
 
 export LHLWorkspace, LHLShift, lhl, lhl!, lhl_reduce!, lhl_shift!, lhl_ldiv!, lhl_refine!,
-    applyZ!, applyZinv!
+    lhl_ldivH!, lhl_refineH!, applyZ!, applyZinv!, applyZH!, applyZinvH!
 
 """
     LHLShift{TG}(n)
@@ -2125,6 +2125,72 @@ function applyZinv!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
     return x
 end
 
+"""
+    applyZH!(x, ws)
+
+`x ← Zᴴ x`.  `n²/2` multiply–adds against the same packed multipliers as [`applyZ!`](@ref):
+`Z = D·P·L` gives `Zᴴ = Lᴴ Pᵀ D` (`D` is real even for a complex reduction).  Uses `ws.xbuf`
+as scratch, so not thread-safe on a shared workspace.
+"""
+function applyZH!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
+    n = ws.n
+    length(x) == n || throw(DimensionMismatch("x has length $(length(x)), the workspace is $n×$n"))
+    if eltype(x) === T
+        y = ws.xbuf
+        _lhl_gatherH!(y, x, ws)
+        _lhl_zsweepH_buf!(y, 0, ws.Lp, n)
+        @inbounds for i in 1:n
+            x[i] = y[i]
+        end
+    else
+        d = ws.scale
+        @inbounds @simd for i in 1:n
+            x[i] *= d[i]
+        end
+        @inbounds for k in 1:(n - 2)
+            p = ws.ipiv[k]
+            p != k + 1 && ((x[k + 1], x[p]) = (x[p], x[k + 1]))
+        end
+        _lhl_zsweepH!(x, ws.Lp, n)
+    end
+    return x
+end
+
+"""
+    applyZinvH!(x, ws)
+
+`x ← Z⁻ᴴ x`.  `n²/2` multiply–adds; `Z⁻ᴴ = D⁻¹ P L⁻ᴴ`, the adjoint counterpart of
+[`applyZinv!`](@ref).  Uses `ws.xbuf` as scratch, so not thread-safe on a shared workspace.
+"""
+function applyZinvH!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
+    n = ws.n
+    length(x) == n || throw(DimensionMismatch("x has length $(length(x)), the workspace is $n×$n"))
+    if eltype(x) === T
+        y = ws.xbuf
+        @inbounds for i in 1:n
+            y[i] = x[i]
+        end
+        _lhl_zero_pad!(y, n)
+        _lhl_zinvsweepH_buf!(y, 0, ws.Lp, n)
+        isc = ws.iscale
+        ip = ws.iperm
+        @inbounds for i in 1:n
+            x[i] = y[ip[i]] * isc[i]
+        end
+    else
+        _lhl_zinvsweepH!(x, ws.Lp, n)
+        @inbounds for k in (n - 2):-1:1
+            p = ws.ipiv[k]
+            p != k + 1 && ((x[k + 1], x[p]) = (x[p], x[k + 1]))
+        end
+        isc = ws.iscale
+        @inbounds @simd for i in 1:n
+            x[i] *= isc[i]
+        end
+    end
+    return x
+end
+
 # y ← P⁻¹D⁻¹x into the padded buffer (the pad stays zero through the sweeps: the padded
 # multipliers are zero).
 function _lhl_gather!(y::Vector, x::AbstractVector, ws::LHLWorkspace)
@@ -2134,6 +2200,18 @@ function _lhl_gather!(y::Vector, x::AbstractVector, ws::LHLWorkspace)
     @inbounds for i in 1:n
         p = perm[i]
         y[i] = x[p] * isc[p]
+    end
+    _lhl_zero_pad!(y, n)
+    return y
+end
+# y ← PᵀDx, the head of the adjoint solve (`D` real, so no conjugation).
+function _lhl_gatherH!(y::Vector, x::AbstractVector, ws::LHLWorkspace)
+    n = ws.n
+    perm = ws.perm
+    d = ws.scale
+    @inbounds for i in 1:n
+        p = perm[i]
+        y[i] = x[p] * d[p]
     end
     _lhl_zero_pad!(y, n)
     return y
@@ -2431,6 +2509,320 @@ for P in (1, 2)
             return y
         end
     end
+end
+
+# Adjoint sweeps on the same packed `Lp`.  Where the forward sweeps broadcast one x
+# element into an axpy over the rows below, the adjoint ones accumulate a dot product
+# from those rows into it: x ← Lᴴx takes the steps ascending (each reads only rows its
+# earlier steps have not written), x ← L⁻ᴴx descending.  Each group's four columns are
+# read tile by tile in the forward order `_lhl_lpack!` laid them out in — the ascending
+# sweep walks the groups like `_lhl_zinvsweep!`, the descending one like `_lhl_zsweep!` —
+# so no second packing is needed.
+function _lhl_zsweepH!(x::AbstractVector, Lp::AbstractVector{T}, n::Int) where {T}
+    W = _lhl_tilew(T)
+    tiled = _lhl_tiled(n, T)
+    G = max(n - 2, 0) >> 2
+    z = zero(T) * zero(eltype(x))
+    o = 0
+    @inbounds for g in 1:G
+        k = 4g - 3
+        h1 = conj(Lp[o + 1]); h2 = conj(Lp[o + 2]); h3 = conj(Lp[o + 3])
+        h4 = conj(Lp[o + 4]); h5 = conj(Lp[o + 5]); h6 = conj(Lp[o + 6])
+        o += _LHL_HEAD
+        m = n - k - 4
+        mp = cld(m, W) * W
+        d1 = z; d2 = z; d3 = z; d4 = z
+        if tiled
+            oc = o
+            i = k + 5
+            while i <= n
+                rows = min(W, n - i + 1)
+                @simd for r in 1:rows
+                    xi = x[i + r - 1]
+                    d1 += conj(Lp[oc + r]) * xi
+                    d2 += conj(Lp[oc + W + r]) * xi
+                    d3 += conj(Lp[oc + 2W + r]) * xi
+                    d4 += conj(Lp[oc + 3W + r]) * xi
+                end
+                oc += 4W
+                i += W
+            end
+        else
+            @simd for i in 1:m
+                xi = x[k + 4 + i]
+                d1 += conj(Lp[o + i]) * xi
+                d2 += conj(Lp[o + mp + i]) * xi
+                d3 += conj(Lp[o + 2mp + i]) * xi
+                d4 += conj(Lp[o + 3mp + i]) * xi
+            end
+        end
+        o += 4mp
+        x2 = x[k + 2]
+        x3 = x[k + 3]
+        x4 = x[k + 4]
+        x[k + 1] += (h1 * x2 + h2 * x3) + (h4 * x4 + d1)
+        x[k + 2] = x2 + (h3 * x3 + h5 * x4) + d2
+        x[k + 3] = x3 + h6 * x4 + d3
+        x[k + 4] = x4 + d4
+    end
+    @inbounds for k in (4G + 1):(n - 2)
+        m = n - k - 1
+        s = z
+        @simd for i in 1:m
+            s += conj(Lp[o + i]) * x[k + 1 + i]
+        end
+        x[k + 1] += s
+        o += cld(m, W) * W
+    end
+    return x
+end
+
+function _lhl_zinvsweepH!(x::AbstractVector, Lp::AbstractVector{T}, n::Int) where {T}
+    W = _lhl_tilew(T)
+    tiled = _lhl_tiled(n, T)
+    G = max(n - 2, 0) >> 2
+    z = zero(T) * zero(eltype(x))
+    o = length(Lp)
+    @inbounds for k in (n - 2):-1:(4G + 1)
+        m = n - k - 1
+        o -= cld(m, W) * W
+        s = z
+        @simd for i in 1:m
+            s += conj(Lp[o + i]) * x[k + 1 + i]
+        end
+        x[k + 1] -= s
+    end
+    @inbounds for g in G:-1:1
+        k = 4g - 3
+        o -= _lhl_group_size(n, k, W)
+        h1 = conj(Lp[o + 1]); h2 = conj(Lp[o + 2]); h3 = conj(Lp[o + 3])
+        h4 = conj(Lp[o + 4]); h5 = conj(Lp[o + 5]); h6 = conj(Lp[o + 6])
+        ob = o + _LHL_HEAD
+        m = n - k - 4
+        mp = cld(m, W) * W
+        d1 = z; d2 = z; d3 = z; d4 = z
+        if tiled
+            oc = ob
+            i = k + 5
+            while i <= n
+                rows = min(W, n - i + 1)
+                @simd for r in 1:rows
+                    xi = x[i + r - 1]
+                    d1 += conj(Lp[oc + r]) * xi
+                    d2 += conj(Lp[oc + W + r]) * xi
+                    d3 += conj(Lp[oc + 2W + r]) * xi
+                    d4 += conj(Lp[oc + 3W + r]) * xi
+                end
+                oc += 4W
+                i += W
+            end
+        else
+            @simd for i in 1:m
+                xi = x[k + 4 + i]
+                d1 += conj(Lp[ob + i]) * xi
+                d2 += conj(Lp[ob + mp + i]) * xi
+                d3 += conj(Lp[ob + 2mp + i]) * xi
+                d4 += conj(Lp[ob + 3mp + i]) * xi
+            end
+        end
+        x4 = x[k + 4] - d4
+        x[k + 4] = x4
+        x3 = x[k + 3] - (h6 * x4 + d3)
+        x[k + 3] = x3
+        x2 = x[k + 2] - ((h3 * x3 + h5 * x4) + d2)
+        x[k + 2] = x2
+        x[k + 1] -= (h1 * x2 + h2 * x3) + (h4 * x4 + d1)
+    end
+    return x
+end
+
+_lhl_zsweepH_buf!(y::AbstractVector, o::Int, Lp::AbstractVector, n::Int) =
+    _lhl_zsweepH!(view(y, (o + 1):length(y)), Lp, n)
+_lhl_zinvsweepH_buf!(y::AbstractVector, o::Int, Lp::AbstractVector, n::Int) =
+    _lhl_zinvsweepH!(view(y, (o + 1):length(y)), Lp, n)
+function _lhl_zsweepH_buf!(y::AbstractVector, oa::Int, ob::Int, Lp::AbstractVector, n::Int)
+    _lhl_zsweepH_buf!(y, oa, Lp, n)
+    return _lhl_zsweepH_buf!(y, ob, Lp, n)
+end
+function _lhl_zinvsweepH_buf!(y::AbstractVector, oa::Int, ob::Int, Lp::AbstractVector, n::Int)
+    _lhl_zinvsweepH_buf!(y, oa, Lp, n)
+    return _lhl_zinvsweepH_buf!(y, ob, Lp, n)
+end
+
+# Rank-4 dot products of a group's body: the accumulator counterpart of `_lhl_zbody!`,
+# with `p`/`pend`/`pa`/`cs` meaning the same.  Two vectors per pass, eight accumulators:
+# the descending sweep's next group cannot start until these sums are folded into the
+# head, so the dot's own latency chain is the critical path.
+@inline function _lhl_zbodyH(
+        ::Type{V}, p::Ptr{T}, pend::Ptr{T}, pa::Int, cs::Int, q::Ptr{T}
+    ) where {W, T, V <: NTuple{W, VecElement{T}}}
+    vb = W * sizeof(T)
+    z = _lhl_bcast(V, zero(T))
+    a1 = a2 = a3 = a4 = b1 = b2 = b3 = b4 = z
+    while p + pa < pend
+        v = _lhl_vload(V, q)
+        w = _lhl_vload(V, q + vb)
+        a1 = _lhl_fma(_lhl_vload(V, p), v, a1)
+        b1 = _lhl_fma(_lhl_vload(V, p + pa), w, b1)
+        a2 = _lhl_fma(_lhl_vload(V, p + cs), v, a2)
+        b2 = _lhl_fma(_lhl_vload(V, p + pa + cs), w, b2)
+        a3 = _lhl_fma(_lhl_vload(V, p + 2cs), v, a3)
+        b3 = _lhl_fma(_lhl_vload(V, p + pa + 2cs), w, b3)
+        a4 = _lhl_fma(_lhl_vload(V, p + 3cs), v, a4)
+        b4 = _lhl_fma(_lhl_vload(V, p + pa + 3cs), w, b4)
+        p += 2pa
+        q += 2vb
+    end
+    if p < pend
+        v = _lhl_vload(V, q)
+        a1 = _lhl_fma(_lhl_vload(V, p), v, a1)
+        a2 = _lhl_fma(_lhl_vload(V, p + cs), v, a2)
+        a3 = _lhl_fma(_lhl_vload(V, p + 2cs), v, a3)
+        a4 = _lhl_fma(_lhl_vload(V, p + 3cs), v, a4)
+    end
+    return _lhl_vsum(_lhl_vadd(a1, b1)), _lhl_vsum(_lhl_vadd(a2, b2)),
+        _lhl_vsum(_lhl_vadd(a3, b3)), _lhl_vsum(_lhl_vadd(a4, b4))
+end
+@inline function _lhl_zdotH(
+        ::Type{V}, p::Ptr{T}, pend::Ptr{T}, q::Ptr{T}
+    ) where {W, T, V <: NTuple{W, VecElement{T}}}
+    vb = W * sizeof(T)
+    z = _lhl_bcast(V, zero(T))
+    a = z
+    b = z
+    while p + vb < pend
+        a = _lhl_fma(_lhl_vload(V, p), _lhl_vload(V, q), a)
+        b = _lhl_fma(_lhl_vload(V, p + vb), _lhl_vload(V, q + vb), b)
+        p += 2vb
+        q += 2vb
+    end
+    p < pend && (a = _lhl_fma(_lhl_vload(V, p), _lhl_vload(V, q), a))
+    return _lhl_vsum(_lhl_vadd(a, b))
+end
+
+# The adjoint sweeps on the padded buffer: full vectors past `n` (both pads zero), one
+# plane at a time.  The planar complex path runs each plane through these — the
+# multipliers are real, so no conjugation and no cross-plane terms.
+function _lhl_zsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    tiled = _lhl_tiled(n, T)
+    G = max(n - 2, 0) >> 2
+    GC.@preserve y Lp begin
+        py = pointer(y) + o * sz
+        h = pointer(Lp)
+        @inbounds for g in 1:G
+            k = 4g - 3
+            p = h + _LHL_HEAD * sz
+            q = py + (k + 4) * sz
+            mpb = cld(n - k - 4, W) * W * sz
+            cs = tiled ? W * sz : mpb
+            pa = tiled ? 4W * sz : W * sz
+            pend = tiled ? p + 4mpb : p + mpb
+            d1, d2, d3, d4 = _lhl_zbodyH(V, p, pend, pa, cs, q)
+            x2 = y[o + k + 2]
+            x3 = y[o + k + 3]
+            x4 = y[o + k + 4]
+            y[o + k + 1] += muladd(unsafe_load(h), x2, muladd(unsafe_load(h, 2), x3, muladd(unsafe_load(h, 4), x4, d1)))
+            y[o + k + 2] = muladd(unsafe_load(h, 3), x3, muladd(unsafe_load(h, 5), x4, x2 + d2))
+            y[o + k + 3] = muladd(unsafe_load(h, 6), x4, x3 + d3)
+            y[o + k + 4] = x4 + d4
+            h = p + 4mpb
+        end
+        @inbounds for k in (4G + 1):(n - 2)
+            q = py + (k + 1) * sz
+            pend = h + cld(n - k - 1, W) * W * sz
+            y[o + k + 1] += _lhl_zdotH(V, h, pend, q)
+            h = pend
+        end
+    end
+    return y
+end
+
+# The head of one descending group: fold the dots in, resolve the 3×3 triangle, return
+# the four values the next group's dots need.
+@inline function _lhl_zinvheadH(y::Vector{T}, o::Int, k::Int, h::Ptr{T}, d1::T, d2::T, d3::T, d4::T) where {T}
+    @inbounds begin
+        x4 = y[o + k + 4] - d4
+        y[o + k + 4] = x4
+        x3 = y[o + k + 3] - muladd(unsafe_load(h, 6), x4, d3)
+        y[o + k + 3] = x3
+        x2 = y[o + k + 2] - muladd(unsafe_load(h, 3), x3, muladd(unsafe_load(h, 5), x4, d2))
+        y[o + k + 2] = x2
+        x1 = y[o + k + 1] - muladd(unsafe_load(h), x2, muladd(unsafe_load(h, 2), x3, muladd(unsafe_load(h, 4), x4, d1)))
+        y[o + k + 1] = x1
+    end
+    return x1, x2, x3, x4
+end
+
+# One column's slice of a pipelined dot's first vector: rows k+1:k+4 from the registers
+# the head just produced, rows k+5:k+W (W = 8 only) from memory.
+@inline function _lhl_zfoldH(pc::Ptr{T}, x1::T, x2::T, x3::T, x4::T, py4::Ptr{T}, W::Int) where {T}
+    s = muladd(
+        unsafe_load(pc), x1, muladd(
+            unsafe_load(pc, 2), x2,
+            muladd(unsafe_load(pc, 3), x3, unsafe_load(pc, 4) * x4)
+        )
+    )
+    for r in 5:W
+        s = muladd(unsafe_load(pc, r), unsafe_load(py4, r - 4), s)
+    end
+    return s
+end
+
+# The descending sweep is a back substitution: each group's dots read the four rows the
+# previous head wrote, so the groups chain.  Pipelined like `_hessenberg_solve_buf!`: the
+# next group's dots over the rows no pending head touches (its body minus its first
+# vector) are issued before the current head's scalar chain, and the first vector is
+# folded in afterwards from registers.
+function _lhl_zinvsweepH_buf!(y::Vector{T}, o::Int, Lp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    tiled = _lhl_tiled(n, T)
+    G = max(n - 2, 0) >> 2
+    GC.@preserve y Lp begin
+        py = pointer(y) + o * sz
+        h = pointer(Lp) + length(Lp) * sz
+        @inbounds for k in (n - 2):-1:(4G + 1)
+            m = cld(n - k - 1, W) * W
+            h -= m * sz
+            q = py + (k + 1) * sz
+            y[o + k + 1] -= _lhl_zdotH(V, h, h + m * sz, q)
+        end
+        G == 0 && return y
+        g = G
+        k = 4G - 3
+        h -= _lhl_group_size(n, k, W) * sz
+        p = h + _LHL_HEAD * sz
+        mpb = cld(n - k - 4, W) * W * sz
+        d1, d2, d3, d4 = _lhl_zbodyH(
+            V, p, tiled ? p + 4mpb : p + mpb, tiled ? 4W * sz : W * sz,
+            tiled ? W * sz : mpb, py + (k + 4) * sz
+        )
+        @inbounds while g > 1
+            k = 4g - 7
+            hn = h - _lhl_group_size(n, k, W) * sz
+            pf = hn + _LHL_HEAD * sz
+            mpbn = cld(n - k - 4, W) * W * sz
+            csn = tiled ? W * sz : mpbn
+            pan = tiled ? 4W * sz : W * sz
+            e1, e2, e3, e4 = _lhl_zbodyH(
+                V, pf + pan, tiled ? pf + 4mpbn : pf + mpbn, pan, csn, py + (k + 4 + W) * sz
+            )
+            x1, x2, x3, x4 = _lhl_zinvheadH(y, o, k + 4, h, d1, d2, d3, d4)
+            py4 = py + (k + 8) * sz
+            d1 = e1 + _lhl_zfoldH(pf, x1, x2, x3, x4, py4, W)
+            d2 = e2 + _lhl_zfoldH(pf + csn, x1, x2, x3, x4, py4, W)
+            d3 = e3 + _lhl_zfoldH(pf + 2csn, x1, x2, x3, x4, py4, W)
+            d4 = e4 + _lhl_zfoldH(pf + 3csn, x1, x2, x3, x4, py4, W)
+            h = hn
+            g -= 1
+        end
+        _lhl_zinvheadH(y, o, 1, h, d1, d2, d3, d4)
+    end
+    return y
 end
 
 # ---------------------------------------------------------------------------
@@ -3040,6 +3432,257 @@ end
 
 @inline _lhl_vsum(v::_LHLVec{T, W}) where {T, W} = sum(ntuple(w -> v[w].value, Val(W + 1)))
 
+# The adjoint Hessenberg solve, on the same `Gt`/`rdiag`/`swap` the forward one consumes.
+# The forward elimination gives G⁻¹ = U⁻¹·Eₙ₋₁Sₙ₋₁⋯E₁S₁ (Sₖ the step-k interchange, Eₖ the
+# multiplier), so G⁻ᴴ = S₁E₁ᴴ⋯Sₙ₋₁Eₙ₋₁ᴴ·U⁻ᴴ: a forward substitution with Uᴴ, then the
+# multiplier/interchange sweep in reverse.  Column k of `Gt` is row k of U, so the Uᴴ
+# substitution runs in axpy form straight down the columns — the transposed storage that
+# makes the forward back substitution a dot sweep makes the adjoint an axpy sweep, four
+# columns per pass.  `LHLShift{T, T}` means real storage (`TG = Tr`), so nothing here
+# conjugates; the complex planar form below does.
+function _hessenberg_solveH!(x::AbstractVector, sh::LHLShift{T, T}) where {T}
+    Gt = sh.Gt
+    rd = sh.rdiag
+    n = sh.n
+    i = 1
+    @inbounds while i + 3 <= n
+        z1 = x[i] * rd[i]
+        x[i] = z1
+        z2 = (x[i + 1] - Gt[i + 1, i] * z1) * rd[i + 1]
+        x[i + 1] = z2
+        z3 = (x[i + 2] - (Gt[i + 2, i] * z1 + Gt[i + 2, i + 1] * z2)) * rd[i + 2]
+        x[i + 2] = z3
+        z4 = (x[i + 3] - ((Gt[i + 3, i] * z1 + Gt[i + 3, i + 1] * z2) + Gt[i + 3, i + 2] * z3)) * rd[i + 3]
+        x[i + 3] = z4
+        @simd for j in (i + 4):n
+            x[j] -= (Gt[j, i] * z1 + Gt[j, i + 1] * z2) + (Gt[j, i + 2] * z3 + Gt[j, i + 3] * z4)
+        end
+        i += 4
+    end
+    @inbounds while i <= n
+        zi = x[i] * rd[i]
+        x[i] = zi
+        @simd for j in (i + 1):n
+            x[j] -= Gt[j, i] * zi
+        end
+        i += 1
+    end
+    _lhl_hess_backwardH!(x, Gt, sh.swap, n)
+    return x
+end
+
+# The mirror of `_lhl_hess_forward!`: undo multiplier then interchange, descending.
+function _lhl_hess_backwardH!(x::AbstractVector, Gt::AbstractMatrix, swap::Vector{Bool}, n::Int)
+    @inbounds for k in (n - 1):-1:1
+        b = x[k + 1]
+        v = x[k] - Gt[k, k + 1] * b
+        s = swap[k]
+        x[k] = ifelse(s, b, v)
+        x[k + 1] = ifelse(s, v, b)
+    end
+    return x
+end
+
+_hessenberg_solveH_buf!(y::AbstractVector, sh::LHLShift) = _hessenberg_solveH!(y, sh)
+
+# On the padded buffer: the four-column axpy runs whole vectors past n (`Gt`'s pad rows
+# and `y`'s pad are zero, so the overrun writes back zeros).
+function _hessenberg_solveH_buf!(y::Vector{T}, sh::LHLShift{T, T}) where {T <: Union{Float32, Float64}}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    Gt = sh.Gt
+    rd = sh.rdiag
+    n = sh.n
+    ldg = size(Gt, 1)
+    GC.@preserve y Gt begin
+        py = pointer(y)
+        pG = pointer(Gt)
+        i = 1
+        @inbounds while i + 3 <= n
+            z1 = y[i] * rd[i]
+            y[i] = z1
+            z2 = (y[i + 1] - Gt[i + 1, i] * z1) * rd[i + 1]
+            y[i + 1] = z2
+            z3 = (y[i + 2] - (Gt[i + 2, i] * z1 + Gt[i + 2, i + 1] * z2)) * rd[i + 2]
+            y[i + 2] = z3
+            z4 = (y[i + 3] - ((Gt[i + 3, i] * z1 + Gt[i + 3, i + 1] * z2) + Gt[i + 3, i + 2] * z3)) * rd[i + 3]
+            y[i + 3] = z4
+            if i + 4 <= n
+                c1 = pG + ((i - 1) * ldg + i + 3) * sz
+                c2 = c1 + ldg * sz
+                c3 = c2 + ldg * sz
+                c4 = c3 + ldg * sz
+                q = py + (i + 3) * sz
+                mb = cld(n - i - 3, W) * W * sz
+                b1 = _lhl_bcast(V, -z1)
+                b2 = _lhl_bcast(V, -z2)
+                b3 = _lhl_bcast(V, -z3)
+                b4 = _lhl_bcast(V, -z4)
+                d = 0
+                while d < mb
+                    v = _lhl_vload(V, q + d)
+                    v = _lhl_fma(_lhl_vload(V, c1 + d), b1, v)
+                    v = _lhl_fma(_lhl_vload(V, c2 + d), b2, v)
+                    v = _lhl_fma(_lhl_vload(V, c3 + d), b3, v)
+                    v = _lhl_fma(_lhl_vload(V, c4 + d), b4, v)
+                    _lhl_vstore!(q + d, v)
+                    d += W * sz
+                end
+            end
+            i += 4
+        end
+        @inbounds while i <= n
+            zi = y[i] * rd[i]
+            y[i] = zi
+            for j in (i + 1):n
+                y[j] -= Gt[j, i] * zi
+            end
+            i += 1
+        end
+        _lhl_hess_backwardH!(y, Gt, sh.swap, n)
+    end
+    return y
+end
+
+# The planar complex adjoint solve: same structure, each conjugated product written out
+# on the planes.
+function _hessenberg_solveH_planar!(y::Vector{Tr}, sh::LHLShift{Complex{Tr}, Tr}) where {Tr}
+    Gt = sh.Gt
+    rd = sh.rdiag
+    n = sh.n
+    o = sh.po
+    C = Complex{Tr}
+    i = 1
+    @inbounds while i + 3 <= n
+        z1 = C(y[i], y[o + i]) * conj(rd[i])
+        y[i] = real(z1)
+        y[o + i] = imag(z1)
+        z2 = (C(y[i + 1], y[o + i + 1]) - conj(_lhl_cget(Gt, o, i + 1, i)) * z1) * conj(rd[i + 1])
+        y[i + 1] = real(z2)
+        y[o + i + 1] = imag(z2)
+        z3 = (C(y[i + 2], y[o + i + 2]) - (conj(_lhl_cget(Gt, o, i + 2, i)) * z1 + conj(_lhl_cget(Gt, o, i + 2, i + 1)) * z2)) * conj(rd[i + 2])
+        y[i + 2] = real(z3)
+        y[o + i + 2] = imag(z3)
+        z4 = (C(y[i + 3], y[o + i + 3]) - ((conj(_lhl_cget(Gt, o, i + 3, i)) * z1 + conj(_lhl_cget(Gt, o, i + 3, i + 1)) * z2) + conj(_lhl_cget(Gt, o, i + 3, i + 2)) * z3)) * conj(rd[i + 3])
+        y[i + 3] = real(z4)
+        y[o + i + 3] = imag(z4)
+        i + 4 <= n && _lhl_paxpy4H!(y, Gt, o, i, n, z1, z2, z3, z4)
+        i += 4
+    end
+    @inbounds while i <= n
+        zi = C(y[i], y[o + i]) * conj(rd[i])
+        y[i] = real(zi)
+        y[o + i] = imag(zi)
+        for j in (i + 1):n
+            v = C(y[j], y[o + j]) - conj(_lhl_cget(Gt, o, j, i)) * zi
+            y[j] = real(v)
+            y[o + j] = imag(v)
+        end
+        i += 1
+    end
+    @inbounds for k in (n - 1):-1:1
+        b = C(y[k + 1], y[o + k + 1])
+        v = C(y[k], y[o + k]) - conj(_lhl_cget(Gt, o, k, k + 1)) * b
+        s = sh.swap[k]
+        xk = ifelse(s, b, v)
+        xk1 = ifelse(s, v, b)
+        y[k] = real(xk)
+        y[o + k] = imag(xk)
+        y[k + 1] = real(xk1)
+        y[o + k + 1] = imag(xk1)
+    end
+    return y
+end
+
+# y[j] -= Σ₄ conj(Gt[·, i+c])·z, j = i+4:n, on the planes: conj(g)z = (gᵣzᵣ + gᵢzᵢ) +
+# im(gᵣzᵢ − gᵢzᵣ).
+@inline function _lhl_paxpy4H!(
+        y::AbstractVector{Tr}, Gt::AbstractMatrix{Tr}, o::Int, i::Int, n::Int,
+        z1::Complex{Tr}, z2::Complex{Tr}, z3::Complex{Tr}, z4::Complex{Tr}
+    ) where {Tr}
+    z1r = real(z1); z1i = imag(z1)
+    z2r = real(z2); z2i = imag(z2)
+    z3r = real(z3); z3i = imag(z3)
+    z4r = real(z4); z4i = imag(z4)
+    @inbounds @simd for j in (i + 4):n
+        yr = y[j]
+        yi = y[o + j]
+        g1r = Gt[j, i]
+        g1i = Gt[o + j, i]
+        g2r = Gt[j, i + 1]
+        g2i = Gt[o + j, i + 1]
+        g3r = Gt[j, i + 2]
+        g3i = Gt[o + j, i + 2]
+        g4r = Gt[j, i + 3]
+        g4i = Gt[o + j, i + 3]
+        yr -= (g1r * z1r + g1i * z1i) + (g2r * z2r + g2i * z2i) +
+            ((g3r * z3r + g3i * z3i) + (g4r * z4r + g4i * z4i))
+        yi -= (g1r * z1i - g1i * z1r) + (g2r * z2i - g2i * z2r) +
+            ((g3r * z3i - g3i * z3r) + (g4r * z4i - g4i * z4r))
+        y[j] = yr
+        y[o + j] = yi
+    end
+    return nothing
+end
+
+# Explicit vectors, running to a full vector past n on both planes.
+@inline function _lhl_paxpy4H!(
+        y::Vector{T}, Gt::Matrix{T}, o::Int, i::Int, n::Int,
+        z1::Complex{T}, z2::Complex{T}, z3::Complex{T}, z4::Complex{T}
+    ) where {T <: Union{Float32, Float64}}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    ldg = size(Gt, 1)
+    GC.@preserve y Gt begin
+        c1 = pointer(Gt) + ((i - 1) * ldg + i + 3) * sz
+        c2 = c1 + ldg * sz
+        c3 = c2 + ldg * sz
+        c4 = c3 + ldg * sz
+        q = pointer(y) + (i + 3) * sz
+        ob = o * sz
+        mb = cld(n - i - 3, W) * W * sz
+        nr1 = _lhl_bcast(V, -real(z1)); ni1 = _lhl_bcast(V, -imag(z1)); pr1 = _lhl_bcast(V, real(z1))
+        nr2 = _lhl_bcast(V, -real(z2)); ni2 = _lhl_bcast(V, -imag(z2)); pr2 = _lhl_bcast(V, real(z2))
+        nr3 = _lhl_bcast(V, -real(z3)); ni3 = _lhl_bcast(V, -imag(z3)); pr3 = _lhl_bcast(V, real(z3))
+        nr4 = _lhl_bcast(V, -real(z4)); ni4 = _lhl_bcast(V, -imag(z4)); pr4 = _lhl_bcast(V, real(z4))
+        d = 0
+        while d < mb
+            yr = _lhl_vload(V, q + d)
+            yi = _lhl_vload(V, q + ob + d)
+            g = _lhl_vload(V, c1 + d)
+            yr = _lhl_fma(g, nr1, yr)
+            yi = _lhl_fma(g, ni1, yi)
+            g = _lhl_vload(V, c1 + ob + d)
+            yr = _lhl_fma(g, ni1, yr)
+            yi = _lhl_fma(g, pr1, yi)
+            g = _lhl_vload(V, c2 + d)
+            yr = _lhl_fma(g, nr2, yr)
+            yi = _lhl_fma(g, ni2, yi)
+            g = _lhl_vload(V, c2 + ob + d)
+            yr = _lhl_fma(g, ni2, yr)
+            yi = _lhl_fma(g, pr2, yi)
+            g = _lhl_vload(V, c3 + d)
+            yr = _lhl_fma(g, nr3, yr)
+            yi = _lhl_fma(g, ni3, yi)
+            g = _lhl_vload(V, c3 + ob + d)
+            yr = _lhl_fma(g, ni3, yr)
+            yi = _lhl_fma(g, pr3, yi)
+            g = _lhl_vload(V, c4 + d)
+            yr = _lhl_fma(g, nr4, yr)
+            yi = _lhl_fma(g, ni4, yi)
+            g = _lhl_vload(V, c4 + ob + d)
+            yr = _lhl_fma(g, ni4, yr)
+            yi = _lhl_fma(g, pr4, yi)
+            _lhl_vstore!(q + d, yr)
+            _lhl_vstore!(q + ob + d, yi)
+            d += W * sz
+        end
+    end
+    return nothing
+end
+
 """
     lhl_ldiv!(x, ws)
     lhl_ldiv!(x, sh::LHLShift, ws)
@@ -3130,6 +3773,87 @@ function _lhl_zero_planes!(y::Vector{T}, n::Int, o::Int) where {T}
     return y
 end
 
+"""
+    lhl_ldivH!(x, ws)
+    lhl_ldivH!(x, sh::LHLShift, ws)
+
+`x ← W⁻ᴴx`, the adjoint counterpart of [`lhl_ldiv!`](@ref), against the *same* reduction
+and the *same* shift LU: `W = Z G Z⁻¹` gives `Wᴴ = Z⁻ᴴ Gᴴ Zᴴ`, so the solve is
+`Zᴴ`, an adjoint Hessenberg solve on the stored factors, then `Z⁻ᴴ` — three `O(n²)`
+phases and no new factorization.  `x` must be able to hold the shift's element type, and
+a complex shift on a real reduction conjugates only the shifted half (`Zᴴ = Zᵀ` is real).
+Uses the shift's `xbuf` as scratch, so concurrent solves must each have their own.
+"""
+lhl_ldivH!(x::AbstractVector, ws::LHLWorkspace) = lhl_ldivH!(x, ws.shift, ws)
+
+function lhl_ldivH!(x::AbstractVector, sh::LHLShift{TG}, ws::LHLWorkspace) where {TG}
+    n = ws.n
+    length(x) == n || throw(DimensionMismatch("x has length $(length(x)), the workspace is $n×$n"))
+    sh.n == n || throw(DimensionMismatch("the LHLShift is $(sh.n)×$(sh.n), the workspace $n×$n"))
+    if eltype(x) === TG
+        y = sh.xbuf
+        _lhl_gatherH!(y, x, ws)
+        _lhl_zsweepH_buf!(y, 0, ws.Lp, n)
+        _hessenberg_solveH_buf!(y, sh)
+        _lhl_zinvsweepH_buf!(y, 0, ws.Lp, n)
+        isc = ws.iscale
+        ip = ws.iperm
+        @inbounds for i in 1:n
+            x[i] = y[ip[i]] * isc[i]
+        end
+    else
+        applyZH!(x, ws)
+        _hessenberg_solveH!(x, sh)
+        applyZinvH!(x, ws)
+    end
+    return x
+end
+
+function lhl_ldivH!(x::AbstractVector, sh::LHLShift{Complex{Tr}, Tr}, ws::LHLWorkspace{T}) where {Tr, T}
+    n = ws.n
+    length(x) == n || throw(DimensionMismatch("x has length $(length(x)), the workspace is $n×$n"))
+    sh.n == n || throw(DimensionMismatch("the LHLShift is $(sh.n)×$(sh.n), the workspace $n×$n"))
+    eltype(x) <: Real &&
+        throw(ArgumentError("a real x cannot hold the solution of a complex shift; use a Vector{$(Complex{Tr})}"))
+    y = sh.xbuf
+    o = sh.po
+    Lp = ws.Lp
+    if T <: Real
+        perm = ws.perm
+        d = ws.scale
+        @inbounds for i in 1:n
+            p = perm[i]
+            v = x[p] * d[p]
+            y[i] = real(v)
+            y[o + i] = imag(v)
+        end
+        _lhl_zero_planes!(y, n, o)
+        _lhl_zsweepH_buf!(y, 0, o, Lp, n)
+        _hessenberg_solveH_planar!(y, sh)
+        _lhl_zinvsweepH_buf!(y, 0, o, Lp, n)
+        isc = ws.iscale
+        ip = ws.iperm
+        @inbounds for i in 1:n
+            p = ip[i]
+            x[i] = Complex(y[p], y[o + p]) * isc[i]
+        end
+    else
+        applyZH!(x, ws)
+        @inbounds for i in 1:n
+            v = x[i]
+            y[i] = real(v)
+            y[o + i] = imag(v)
+        end
+        _lhl_zero_planes!(y, n, o)
+        _hessenberg_solveH_planar!(y, sh)
+        @inbounds for i in 1:n
+            x[i] = Complex(y[i], y[o + i])
+        end
+        applyZinvH!(x, ws)
+    end
+    return x
+end
+
 
 """
     lhl_refine!(x, A, b, ws, steps)
@@ -3151,6 +3875,31 @@ function lhl_refine!(x::AbstractVector, A, b::AbstractVector, sh::LHLShift, ws::
         mul!(r, A, x)
         r .= b .- r
         lhl_ldiv!(r, sh, ws)
+        x .+= r
+    end
+    return x
+end
+
+"""
+    lhl_refineH!(x, A, b, ws, steps)
+    lhl_refineH!(x, A, b, sh::LHLShift, ws, steps)
+
+Apply `steps` rounds of fixed-precision iterative refinement to a solve of `Aᴴ x = b` —
+the adjoint counterpart of [`lhl_refine!`](@ref), driven by [`lhl_ldivH!`](@ref).  `A` is
+the matrix the workspace factorized, *not* its adjoint: the residual is formed with
+`mul!(r, A', x)`, so `A` only needs a lazy adjoint matvec.
+"""
+lhl_refineH!(x::AbstractVector, A, b::AbstractVector, ws::LHLWorkspace, steps::Int) =
+    lhl_refineH!(x, A, b, ws.shift, ws, steps)
+
+function lhl_refineH!(x::AbstractVector, A, b::AbstractVector, sh::LHLShift, ws::LHLWorkspace, steps::Int)
+    steps <= 0 && return x
+    r = sh.resid
+    Ah = A'
+    for _ in 1:steps
+        mul!(r, Ah, x)
+        r .= b .- r
+        lhl_ldivH!(r, sh, ws)
         x .+= r
     end
     return x
@@ -3210,9 +3959,11 @@ if ccall(:jl_generating_output, Cint, ()) == 1
                 b = ones(T, n)
                 x = lhl_ldiv!(copy(b), ws)
                 lhl_refine!(x, J, b, ws, 1)
+                lhl_refineH!(lhl_ldivH!(copy(b), ws), J, b, ws, 1)
                 sh = LHLShift{Complex{T}}(ws)
                 lhl_shift!(sh, ws, one(T), Complex{T}(0, 1) / 8)
                 lhl_ldiv!(Complex{T}.(b), sh, ws)
+                lhl_ldivH!(Complex{T}.(b), sh, ws)
             end
         end
     end
