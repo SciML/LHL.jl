@@ -5,6 +5,7 @@ version = "2.0.0"
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 
 [weakdeps]
 Polyester = "f517fe37-dbe3-4b94-8317-1923a5111588"
@@ -14,6 +15,7 @@ LHLFactorizationPolyesterExt = "Polyester"
 
 [compat]
 LinearAlgebra = "1.10"
+PrecompileTools = "1.2"
 Polyester = "0.7"
 Random = "1"
 SafeTestsets = "0.1"
