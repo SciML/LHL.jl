@@ -24,9 +24,9 @@ __init__() = (_LHL_BACKEND[] = LHLPolyester())
 if ccall(:jl_generating_output, Cint, ()) == 1
     let
         _LHL_BACKEND[] = LHLPolyester()
-        for T in (Float64, Float32)
+        for T in (Float64, Float32, ComplexF64, ComplexF32)
             n = 160
-            J = T[1 / (i + j) + (i == j) for i in 1:n, j in 1:n]
+            J = T[1 / (i + j) + (i == j) * (T <: Complex ? 1 + im : 1) for i in 1:n, j in 1:n]
             ws = lhl(J)
             lhl!(ws, J; thread = true)
             _lhl_reduce_blocked!(LHLPolyester(), ws.fstore, ws.ipiv, ws.Ht, ws.work, ws.pack, 16, 2)

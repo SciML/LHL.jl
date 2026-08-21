@@ -1,5 +1,23 @@
 # Release Notes
 
+## Unreleased
+
+  - **Explicit-vector kernels for fully complex workspaces** (`lhl(J::Matrix{ComplexF64})`
+    and `ComplexF32`). The reduction's trailing update, trailing GEMM and panel GEMV now
+    run real explicit-vector kernels on the interleaved storage, and the solves' Z sweeps
+    run on real planes (a planar copy of the packed multipliers). Measured on one Zen2
+    core, a `ComplexF64` reduction runs at 2–3.8× the same-size real one (the flop ratio
+    is 4) instead of 6.4–7.5×, and `lhl_ldiv!` at ≈2.5× instead of ≈4.7×. The threaded
+    reduction now covers `ComplexF64` (`n ≥ 512`) and `ComplexF32` (`n ≥ 1024`), and is
+    still bit-identical for any thread count. The `factors` layout is unchanged.
+
+  - **Complex pivot magnitudes and balance norms are now `|re| + |im|`** (LAPACK's
+    `CABS1`, as the shifted LU already used), replacing `abs`. Pivot *choices* of a
+    complex reduction can therefore differ from v2.0.0 in near-ties; results differ at
+    rounding level, both choices are equally valid partial pivoting, and complex
+    multipliers are now bounded by `√2` in modulus (LAPACK's own bound for `zgetrf`)
+    rather than 1. Real workspaces are bit-for-bit unaffected.
+
 ## v2.0
 
 Breaking. The changes below are mechanical to adopt; `lhl`, `lhl!`, `lhl_reduce!`,

@@ -22,27 +22,29 @@ function threading_tests()
             # reduction writes
             for w in (w1, w2)
                 fill!(w.Lp, 0)
+                fill!(w.Lpp, 0)
                 fill!(w.Ht, 0)
             end
             lhl!(w1, J; balance, thread = Val(false))
             lhl!(w2, J; balance, thread = Val(true))
             return w1, w2
         end
-        for (T, n) in ((Float64, 520), (Float64, 777), (Float32, 1030)), balance in (true, false)
+        for (T, n) in ((Float64, 520), (Float64, 777), (Float32, 1030), (ComplexF64, 777), (ComplexF32, 1030)), balance in (true, false)
             J = randn(MersenneTwister(n), T, n, n)
             w1, w2 = both(J, balance)
             @test w1.ipiv == w2.ipiv
             @test w1.factors == w2.factors
             @test w1.Lp == w2.Lp
+            @test w1.Lpp == w2.Lpp
             @test w1.Ht == w2.Ht
             b = randn(MersenneTwister(n + 1), T, n)
-            for (σ, τ) in ((1, -0.05), (0, 1))
+            for (σ, τ) in (T <: Complex ? ((1, -0.05 + 0.02im), (0, 1)) : ((1, -0.05), (0, 1)))
                 lhl_shift!(w1, σ, τ)
                 lhl_shift!(w2, σ, τ)
                 x1 = lhl_ldiv!(copy(b), w1)
                 x2 = lhl_ldiv!(copy(b), w2)
                 @test x1 == x2
-                @test bwd(σ * I + τ * J, x2, b) <= 20n * eps(T)
+                @test bwd(σ * I + τ * J, x2, b) <= 20n * eps(real(T))
             end
             # Before Julia 1.12, `@batch` code compiled into the extension's image pays 112
             # bytes per region when run on more than one thread (Polyester's cfunction
@@ -77,7 +79,7 @@ function threading_tests()
             @test wu.ipiv == w2.ipiv
             @test norm(w2.factors - wu.factors) <= 100n * eps(T) * norm(wu.factors)
         end
-        # a Bool works too, and other element types stay serial
+        # a Bool works too
         J = randn(MersenneTwister(5), ComplexF64, 800, 800)
         w1 = lhl(J; thread = false)
         w2 = lhl(J; thread = true)
