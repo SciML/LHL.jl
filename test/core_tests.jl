@@ -75,7 +75,8 @@ end
         wb, wu = reduce_both(J, balance)
         @test wb.ipiv == wu.ipiv
         @test wb.factors ≈ wu.factors
-        @test all(abs.(tril(wb.factors, -2)) .<= 1)
+        # |re| + |im| pivoting bounds a complex multiplier's modulus by √2, a real one by 1
+        @test all(abs.(tril(wb.factors, -2)) .<= (T <: Complex ? sqrt(2) : 1) + 4 * eps())
         ws = lhl(J; balance)
         @test ws.ipiv == wb.ipiv
         @test ws.factors ≈ wb.factors
@@ -455,5 +456,128 @@ end
         Ae, ipe = reduce_unblocked(T.(J), false)
         @test ipg == ipe
         @test Ag ≈ Ae
+    end
+end
+
+# The fully complex workspace: the interleaved real-view kernels (trailing update,
+# expanded GEMM, grouped GEMV) against the generic paths (reached through a row-strided
+# view) and against `\`, the planar solve sweeps, and the |re| + |im| pivot magnitudes.
+@testset "fully complex workspace: $T" for T in (ComplexF64, ComplexF32)
+    Tr = real(T)
+    rtol = Tr === Float32 ? 1.0e-3 : 1.0e-9
+    # explicit trailing update vs the generic paired sweep: identical pivots, same values
+    # up to summation order.  Past n ≈ 200 the Float32 orders differ by ~n·eps, enough to
+    # flip a near-tie |re| + |im| pivot (observed on 1.12 at n = 257), after which the two
+    # equally valid reductions diverge — larger sizes are covered by the solve tests below.
+    for n in vcat(1:24, Tr === Float32 ? [40, 64, 100, 129] : [40, 64, 100, 129, 200, 257])
+        J = T.(randn(MersenneTwister(n), ComplexF64, n, n))
+        Ag, ipg = reduce_unblocked(J, true)
+        Ae, ipe = reduce_unblocked(J, false)
+        @test ipg == ipe
+        @test relerr(Ae, Ag) <= 200n * eps(Tr)
+        @test all(abs.(tril(Ae, -2)) .<= sqrt(2) + 4 * eps(Tr))
+    end
+    # exact ties in |re| + |im| hit the pivot comparison and both interchange branches
+    for m in (30, 150)
+        J = T.(
+            rand(MersenneTwister(m), -1:1, m, m) .+
+                im .* rand(MersenneTwister(m + 1), -1:1, m, m)
+        )
+        Ag, ipg = reduce_unblocked(J, true)
+        Ae, ipe = reduce_unblocked(J, false)
+        @test ipg == ipe
+        @test Ag ≈ Ae
+        @test all(abs.(tril(Ae, -2)) .<= sqrt(2) + 4 * eps(Tr))
+    end
+    # Z passes against dense Z, and the documented `factors` layout: Z·H·Z⁻¹ = balanced J
+    for n in (17, 80, 200), balance in (true, false)
+        J = T.(randn(MersenneTwister(n), ComplexF64, n, n))
+        ws = lhl(J; balance)
+        Z = Matrix{T}(I, n, n)
+        Zi = Matrix{T}(I, n, n)
+        for j in 1:n
+            applyZ!(view(Z, :, j), ws)
+            applyZinv!(view(Zi, :, j), ws)
+        end
+        @test Z * Zi ≈ I atol = (Tr === Float32 ? 1.0e-3 : 1.0e-8)
+        H = triu(ws.factors, -1)
+        @test Z * H * Zi ≈ J rtol = (Tr === Float32 ? 2.0e-3 : 1.0e-8)
+    end
+    # solves across the unblocked/blocked and sweep-tiling thresholds vs `\`; 530 and 1040
+    # take the ComplexF64 blocked path, 1040 also the untiled planar sweeps
+    for n in (2, 3, 5, 16, 40, 129, 260, 530, 1040), balance in (true, false)
+        Tr === Float32 && n > 530 && continue   # κ·eps already caps Float32 accuracy
+        J = T.(randn(MersenneTwister(n), ComplexF64, n, n))
+        b = T.(randn(MersenneTwister(n + 7), ComplexF64, n))
+        ws = lhl(J; balance)
+        for (σ, τ) in ((one(T), T(-1 // 20, 3 // 10)), (T(2, -1), T(0, 1)), (one(T), T(-1 // 20)))
+            Wm = σ * I + τ * J
+            lhl_shift!(ws, σ, τ)
+            x = lhl_ldiv!(copy(b), ws)
+            @test x ≈ Matrix(Wm) \ b rtol = (n <= 260 ? rtol : 50 * rtol)
+            # the raw solve's backward error carries κ(Z), which grows with n
+            @test bwd(Matrix(Wm), x, b) < max(800, 2n) * eps(Tr)
+        end
+    end
+    # a second complex shift held against one complex reduction, and refinement
+    n = 70
+    J = T.(randn(MersenneTwister(70), ComplexF64, n, n))
+    b = T.(randn(MersenneTwister(71), ComplexF64, n))
+    ws = lhl(J)
+    sh = LHLShift{T}(ws)
+    @test sh isa LHLShift{T, Tr}
+    for (γ1, γ2) in ((T(1 // 10, 1 // 5), T(1 // 20, -3 // 10)),)
+        lhl_shift!(ws, one(T), -γ1)
+        lhl_shift!(sh, ws, one(T), -γ2)
+        W1 = Matrix(I - γ1 * J)
+        W2 = Matrix(I - γ2 * J)
+        @test lhl_ldiv!(copy(b), ws) ≈ W1 \ b rtol = rtol
+        @test lhl_ldiv!(copy(b), sh, ws) ≈ W2 \ b rtol = rtol
+        x = lhl_refine!(lhl_ldiv!(copy(b), sh, ws), W2, b, sh, ws, 1)
+        @test bwd(W2, x, b) < 50 * eps(Tr)
+        @test sh.info == 0 && sh.τ == -γ2
+    end
+    # near-nilpotent: κ(Z) enormous, refinement restores the backward error
+    J = T.(triu(randn(MersenneTwister(72), ComplexF64, 60, 60), 1))
+    J[60, 1] = T(1.0e-6)
+    b60 = T.(randn(MersenneTwister(73), ComplexF64, 60))
+    Wm = Matrix(I - T(1 // 2) * J)
+    ws = lhl(J)
+    lhl_shift!(ws, 1, -T(1 // 2))
+    x = lhl_refine!(lhl_ldiv!(copy(b60), ws), Wm, b60, ws, 1)
+    @test bwd(Wm, x, b60) < 50 * eps(Tr)
+    # a singular complex shift is reported, not thrown
+    wd = lhl(T[1 0; 0 2])
+    lhl_shift!(wd, 1, -1)
+    @test wd.info != 0
+end
+
+@testset "complex allocation-free paths" begin
+    # 530 crosses the ComplexF64 blocked threshold, 1040 the sweep-tiling limit
+    for T in (ComplexF64, ComplexF32), m in (64, 530)
+        Jm = randn(MersenneTwister(m), T, m, m) + 3m * I
+        ws = lhl(Jm; thread = Val(false))
+        sh = LHLShift{T}(ws)
+        σm = randn(MersenneTwister(m + 1), T)
+        τm = randn(MersenneTwister(m + 2), T)
+        Wc = Matrix(σm * I + τm * Jm)
+        x = randn(MersenneTwister(m + 3), T, m)
+        bc = copy(x)
+        lhl_shift!(ws, σm, τm)
+        lhl_shift!(sh, ws, σm, τm)
+        lhl_ldiv!(x, ws)
+        lhl_ldiv!(x, sh, ws)
+        applyZ!(x, ws)
+        applyZinv!(x, ws)
+        lhl_refine!(x, Wc, bc, ws, 1)
+        lhl!(ws, Jm; thread = Val(false))
+        @test @allocated(lhl_shift!(ws, σm, τm)) == 0
+        @test @allocated(lhl_shift!(sh, ws, σm, τm)) == 0
+        @test @allocated(lhl_ldiv!(x, ws)) == 0
+        @test @allocated(lhl_ldiv!(x, sh, ws)) == 0
+        @test @allocated(applyZ!(x, ws)) == 0
+        @test @allocated(applyZinv!(x, ws)) == 0
+        @test @allocated(lhl_refine!(x, Wc, bc, ws, 1)) == 0
+        @test @allocated(lhl!(ws, Jm; thread = Val(false))) == 0
     end
 end

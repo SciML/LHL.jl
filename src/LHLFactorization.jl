@@ -6,8 +6,9 @@ Gaussian similarity transformations with partial pivoting,
 
     J = Z H Z⁻¹,   Z = D·P·L
 
-with `L` unit lower triangular (multipliers bounded by 1), `P` a permutation and `D` a
-balancing diagonal.  This is Wilkinson's elimination method — EISPACK's `ELMHES` — packaged
+with `L` unit lower triangular (multipliers bounded by 1 in modulus — by `√2` for a
+complex `J`, whose pivot magnitudes are `|re| + |im|`, as LAPACK's), `P` a permutation
+and `D` a balancing diagonal.  This is Wilkinson's elimination method — EISPACK's `ELMHES` — packaged
 for a purpose it is rarely exposed for: **solving a family of shifted systems**
 
     (σI + τJ) x = b
@@ -54,6 +55,10 @@ using LinearAlgebra: checksquare, mul!
 
 export LHLWorkspace, LHLShift, lhl, lhl!, lhl_reduce!, lhl_shift!, lhl_ldiv!, lhl_refine!,
     applyZ!, applyZinv!
+
+# The complex element types with explicit-vector kernels (planar shift state, interleaved
+# real-view reduction kernels, planar solve sweeps).
+const _LHL_CFloat = Union{ComplexF32, ComplexF64}
 
 """
     LHLShift{TG}(n)
@@ -128,7 +133,8 @@ are the two choices.  (`LHLWorkspace{T, Tr, TG}`: `Tr = real(T)`, `TG` the shift
 positions `factors[k+2:n, k]`, exactly the way an LU packs its own; `Lp` holds the same
 multipliers repacked for the solves (see `_lhl_lpack!`: groups of four columns interleaved
 in `W`-row tiles, zero padded, so that a rank-4 sweep reads one contiguous stream with no
-remainder loop).  `perm`/`iperm` are the pivot permutation `P` and its inverse, `iscale`
+remainder loop); for a `ComplexF32`/`ComplexF64` workspace `Lpp` holds them once more as
+two real planes, which the solves' planar sweeps read instead.  `perm`/`iperm` are the pivot permutation `P` and its inverse, `iscale`
 the reciprocals of the balancing `scale` (powers of two, so exact), and `xbuf` a padded
 copy of the vector `applyZ!`/`applyZinv!` work in.  `Ht` holds `H` **transposed** (see
 [`LHLShift`](@ref) for why); `Ht`, `work` and `pack` are scratch during the reduction,
@@ -145,6 +151,10 @@ mutable struct LHLWorkspace{T, Tr, TG}
     fstore::Matrix{T}
     factors::SubArray{T, 2, Matrix{T}, Tuple{UnitRange{Int}, UnitRange{Int}}, false}
     Lp::Vector{T}
+    # For a ComplexF32/ComplexF64 `T`: the same multipliers again as two real planes (re,
+    # then im, each in the real type's packed layout), for the planar solve sweeps.
+    # Empty otherwise.
+    Lpp::Vector{Tr}
     ipiv::Vector{Int}
     perm::Vector{Int}
     iperm::Vector{Int}
@@ -171,6 +181,7 @@ function LHLWorkspace{T}(n::Integer; shift::Type = T) where {T}
     F = Matrix{T}(undef, _lhl_ld(n, T), n)
     return LHLWorkspace{T, Tr, TG}(
         F, view(F, 1:n, 1:n), Vector{T}(undef, _lhl_lpack_len(n, W)),
+        Vector{Tr}(undef, _lhl_lpp_len(n, T)),
         Vector{Int}(undef, max(n - 2, 0)), collect(1:n), collect(1:n), ones(Tr, n), ones(Tr, n),
         Matrix{T}(undef, n, n), Vector{T}(undef, n), Vector{T}(undef, _lhl_pack_len(n, T)),
         zeros(T, n + W), LHLShift{TG}(n), false, n
@@ -240,6 +251,9 @@ function _lhl_ld(n::Int, ::Type{T}) where {T}
     return ld
 end
 
+_lhl_lpp_len(n::Int, ::Type{T}) where {T} =
+    T <: _LHL_CFloat ? 2 * _lhl_lpack_len(n, _lhl_tilew(real(T))) : 0
+
 # Scratch for the blocked reduction's packed GEMM/TRSM operands (`_lhl_gemm_micro!`,
 # `_lhl_trsm_block!`) and, on the Float32/Float64 path, the GEMV partials of the column
 # groups plus per-chunk and per-group tables (`_lhl_panel_steps!`).
@@ -249,6 +263,9 @@ function _lhl_pack_len(n::Int, ::Type{T}) where {T}
     if T <: Union{Float32, Float64}
         P = cld(n, _LHL_GEMV_GROUP)
         len = max(len, P * _lhl_ld(n, T) + 4nb * Threads.nthreads() + 2nb * P)
+    elseif T <: _LHL_CFloat
+        # room for the expanded GEMM panel (real view) and the panel GEMV's group partials
+        len = max(2 * len, cld(n, _LHL_GEMV_GROUP) * (n + 8))
     end
     return len
 end
@@ -260,6 +277,7 @@ function _lhl_resize!(ws::LHLWorkspace{T}, n::Int) where {T}
     ws.factors = view(ws.fstore, 1:n, 1:n)
     ws.Ht = Matrix{T}(undef, n, n)
     resize!(ws.Lp, _lhl_lpack_len(n, W))
+    resize!(ws.Lpp, _lhl_lpp_len(n, T))
     resize!(ws.ipiv, max(n - 2, 0))
     resize!(ws.perm, n)
     resize!(ws.iperm, n)
@@ -295,7 +313,8 @@ end
 # ---------------------------------------------------------------------------
 
 # Parlett–Reinsch scaling: equalize each row/column norm pair by a power of two, which is
-# exact in binary floating point and so costs no accuracy.
+# exact in binary floating point and so costs no accuracy.  Complex magnitudes are
+# |re| + |im| (`_lhl_pivmag`), as EISPACK's CBAL and LAPACK's CABS1 — no hypot per element.
 function _lhl_balance!(A::AbstractMatrix{T}, d::AbstractVector, isc::AbstractVector) where {T}
     n = size(A, 2)
     Tr = real(T)
@@ -308,8 +327,8 @@ function _lhl_balance!(A::AbstractMatrix{T}, d::AbstractVector, isc::AbstractVec
             r = zero(Tr)
             @inbounds for j in 1:n
                 j == i && continue
-                c += abs(A[j, i])
-                r += abs(A[i, j])
+                c += _lhl_pivmag(A[j, i])
+                r += _lhl_pivmag(A[i, j])
             end
             (iszero(c) || iszero(r)) && continue
             f = one(Tr)
@@ -373,6 +392,7 @@ function lhl_reduce!(ws::LHLWorkspace{T}, J::AbstractMatrix, balance::Bool, thre
     end
     _lhl_reduce_core!(_LHL_BACKEND[], ws, thread)
     _lhl_lpack!(ws.Lp, A, n, Val(_lhl_tilew(T)))
+    T <: _LHL_CFloat && _lhl_lpack2!(ws.Lpp, A, n, Val(_lhl_tilew(real(T))))
     perm = ws.perm
     iperm = ws.iperm
     @inbounds for i in 1:n
@@ -463,13 +483,81 @@ function _lhl_lpack!(Lp::Vector{T}, A::AbstractMatrix{T}, n::Int, ::Val{W}) wher
     return Lp
 end
 
+# `_lhl_lpack!` once more for a complex `A`, splitting each multiplier into the re plane
+# (`Lpp[1:end÷2]`) and the im plane behind it, both in the real type's packed layout
+# (`W = _lhl_tilew(Tr)`, tiling by `_lhl_tiled(n, Tr)`) so the planar sweeps read them
+# with the real kernels' geometry.
+function _lhl_lpack2!(Lpp::Vector{Tr}, A::AbstractMatrix{T}, n::Int, ::Val{W}) where {Tr, T, W}
+    Lh = length(Lpp) >> 1
+    G = max(n - 2, 0) >> 2
+    tiled = _lhl_tiled(n, Tr)
+    o = 0
+    @inline st!(o_, i_, v) = @inbounds begin
+        Lpp[o_ + i_] = real(v)
+        Lpp[Lh + o_ + i_] = imag(v)
+        nothing
+    end
+    @inbounds for g in 1:G
+        k = 4g - 3
+        st!(o, 1, A[k + 2, k])
+        st!(o, 2, A[k + 3, k])
+        st!(o, 3, A[k + 3, k + 1])
+        st!(o, 4, A[k + 4, k])
+        st!(o, 5, A[k + 4, k + 1])
+        st!(o, 6, A[k + 4, k + 2])
+        o += _LHL_HEAD
+        m = n - k - 4
+        mp = cld(m, W) * W
+        if tiled
+            for c in 0:3
+                ob = o + c * W
+                i = 0
+                while i + W <= m
+                    for r in 1:W
+                        st!(ob, r, A[k + 4 + i + r, k + c])
+                    end
+                    ob += 4W
+                    i += W
+                end
+                if i < m
+                    for r in 1:W
+                        st!(ob, r, i + r <= m ? A[k + 4 + i + r, k + c] : zero(T))
+                    end
+                end
+            end
+        else
+            for c in 0:3
+                ob = o + c * mp
+                for i in 1:m
+                    st!(ob, i, A[k + 4 + i, k + c])
+                end
+                for i in (m + 1):mp
+                    st!(ob, i, zero(T))
+                end
+            end
+        end
+        o += 4mp
+    end
+    @inbounds for k in (4G + 1):(n - 2)
+        m = n - k - 1
+        for i in 1:m
+            st!(o, i, A[k + 1 + i, k])
+        end
+        for i in (m + 1):(cld(m, W) * W)
+            st!(o, i, zero(T))
+        end
+        o += cld(m, W) * W
+    end
+    return Lpp
+end
+
 function _lhl_reduce_unblocked!(A::AbstractMatrix{T}, ipiv) where {T}
     n = size(A, 2)
     @inbounds for k in 1:(n - 2)
         p = k + 1
-        amax = abs(A[k + 1, k])
+        amax = _lhl_pivmag(A[k + 1, k])
         for i in (k + 2):n
-            a = abs(A[i, k])
+            a = _lhl_pivmag(A[i, k])
             if a > amax
                 amax = a
                 p = i
@@ -677,6 +765,158 @@ end
     return nothing
 end
 
+# ---------------------------------------------------------------------------
+# Complex kernels on the interleaved storage.  A complex column is read through a
+# real-typed pointer: element i sits at real lanes 2i-1 (re) and 2i (im), so a vector of
+# W real lanes holds W÷2 consecutive complex elements.  A product a·b then splits into
+# b.re times the plain lanes plus b.im times the swap-negated lanes (-im, re) — and the
+# swap-negation only ever happens *outside* the inner loops: on multiplier vectors held
+# in registers across a whole row block, and on accumulators after a column sweep, since
+# Σⱼ swapneg(aⱼ)·cⱼ = swapneg(Σⱼ aⱼ·cⱼ).  The inner loops are pure loads, FMAs and
+# stores, exactly like the real kernels with twice the vectors — measured at parity with
+# planar (two real planes) storage, which would have cost `factors` its documented layout.
+# ---------------------------------------------------------------------------
+
+@inline _lhl_vswapneg(v::_LHLVec{T, W}) where {T, W} =
+    ntuple(w -> VecElement(isodd(w) ? -v[w + 1].value : v[w - 1].value), Val(W + 1))
+@inline _lhl_clanemask(::Val{W}, i0::Int, lo::Int) where {W} =
+    ntuple(w -> i0 + ((w - 1) >> 1) >= lo, Val(W))
+
+function _lhl_trailing_update!(A::StridedMatrix{T}, k::Int, n::Int) where {T <: _LHL_CFloat}
+    Tr = real(T)
+    V = _lhl_vectype(Tr)
+    W = _LHL_VEC_BYTES ÷ sizeof(Tr)
+    Wc = W >> 1
+    (n < max(W, 8) || stride(A, 1) != 1) &&
+        return invoke(_lhl_trailing_update!, Tuple{AbstractMatrix, Int, Int}, A, k, n)
+    GC.@preserve A begin
+        pA = Ptr{Tr}(pointer(A))
+        lds = stride(A, 2) * sizeof(T)
+        i = _lhl_crb_rows!(Val(false), V, pA, lds, 1, k + 1, k, n)
+        if i <= k + 1
+            i0 = min(i, n - Wc + 1)
+            _lhl_crb_masked!(V, pA, lds, i0, i, k, n)
+            i = i0 + Wc
+        end
+        if i <= n
+            i = _lhl_crb_rows!(Val(true), V, pA, lds, i, n, k, n)
+            i <= n && _lhl_crb_masked!(V, pA, lds, n - Wc + 1, i, k, n)
+        end
+    end
+    return A
+end
+
+# Whole blocks of complex rows ia:ib, with (L = true) or without the left update; two
+# vectors (W complex rows), then one; returns the first row not covered.
+@inline function _lhl_crb_rows!(
+        ::Val{L}, ::Type{V}, pA::Ptr{T}, lds::Int, ia::Int, ib::Int, k::Int, n::Int
+    ) where {L, W, T, V <: NTuple{W, VecElement{T}}}
+    sz = sizeof(T)
+    vb = W * sz
+    Wc = W >> 1
+    prk0 = pA + 2k * sz + (k + 1) * lds        # A[k+1, k+2]
+    pck0 = pA + (2k + 2) * sz + (k - 1) * lds  # A[k+2, k]
+    z = _lhl_bcast(V, zero(T))
+    i = ia
+    while i + W - 1 <= ib
+        prow = pA + 2 * (i - 1) * sz
+        pl = prow + (k - 1) * lds
+        l1 = _lhl_vload(V, pl); l2 = _lhl_vload(V, pl + vb)
+        m1 = _lhl_vswapneg(l1); m2 = _lhl_vswapneg(l2)
+        sr1 = sr2 = si1 = si2 = z
+        pcol = prow + (k + 1) * lds
+        prk = prk0
+        pck = pck0
+        for _ in (k + 2):n
+            bvr = _lhl_bcast(V, unsafe_load(pck))
+            bvi = _lhl_bcast(V, unsafe_load(pck, 2))
+            a1 = _lhl_vload(V, pcol); a2 = _lhl_vload(V, pcol + vb)
+            if L
+                bpr = _lhl_bcast(V, -unsafe_load(prk))
+                bpi = _lhl_bcast(V, -unsafe_load(prk, 2))
+                a1 = _lhl_fma(m1, bpi, _lhl_fma(l1, bpr, a1))
+                a2 = _lhl_fma(m2, bpi, _lhl_fma(l2, bpr, a2))
+                _lhl_vstore!(pcol, a1); _lhl_vstore!(pcol + vb, a2)
+            end
+            sr1 = _lhl_fma(a1, bvr, sr1); si1 = _lhl_fma(a1, bvi, si1)
+            sr2 = _lhl_fma(a2, bvr, sr2); si2 = _lhl_fma(a2, bvi, si2)
+            pcol += lds
+            prk += lds
+            pck += 2sz
+        end
+        pc = prow + k * lds
+        _lhl_vstore!(pc, _lhl_vadd(_lhl_vload(V, pc), _lhl_vadd(sr1, _lhl_vswapneg(si1))))
+        _lhl_vstore!(pc + vb, _lhl_vadd(_lhl_vload(V, pc + vb), _lhl_vadd(sr2, _lhl_vswapneg(si2))))
+        i += W
+    end
+    while i + Wc - 1 <= ib
+        prow = pA + 2 * (i - 1) * sz
+        l1 = _lhl_vload(V, prow + (k - 1) * lds)
+        m1 = _lhl_vswapneg(l1)
+        sr1 = z
+        si1 = z
+        pcol = prow + (k + 1) * lds
+        prk = prk0
+        pck = pck0
+        for _ in (k + 2):n
+            bvr = _lhl_bcast(V, unsafe_load(pck))
+            bvi = _lhl_bcast(V, unsafe_load(pck, 2))
+            a1 = _lhl_vload(V, pcol)
+            if L
+                bpr = _lhl_bcast(V, -unsafe_load(prk))
+                bpi = _lhl_bcast(V, -unsafe_load(prk, 2))
+                a1 = _lhl_fma(m1, bpi, _lhl_fma(l1, bpr, a1))
+                _lhl_vstore!(pcol, a1)
+            end
+            sr1 = _lhl_fma(a1, bvr, sr1)
+            si1 = _lhl_fma(a1, bvi, si1)
+            pcol += lds
+            prk += lds
+            pck += 2sz
+        end
+        pc = prow + k * lds
+        _lhl_vstore!(pc, _lhl_vadd(_lhl_vload(V, pc), _lhl_vadd(sr1, _lhl_vswapneg(si1))))
+        i += Wc
+    end
+    return i
+end
+
+# One vector of complex rows i0:i0+W÷2-1: only rows ≥ lo take part, of those only rows
+# ≥ k+2 get the left update; excluded lanes are stored back unchanged.
+@inline function _lhl_crb_masked!(
+        ::Type{V}, pA::Ptr{T}, lds::Int, i0::Int, lo::Int, k::Int, n::Int
+    ) where {W, T, V <: NTuple{W, VecElement{T}}}
+    sz = sizeof(T)
+    ma = _lhl_clanemask(Val(W), i0, lo)
+    ml = _lhl_clanemask(Val(W), i0, max(lo, k + 2))
+    z = _lhl_bcast(V, zero(T))
+    prow = pA + 2 * (i0 - 1) * sz
+    l1 = _lhl_vselect(ml, _lhl_vload(V, prow + (k - 1) * lds), z)
+    m1 = _lhl_vswapneg(l1)
+    sr1 = z
+    si1 = z
+    pcol = prow + (k + 1) * lds
+    prk = pA + 2k * sz + (k + 1) * lds
+    pck = pA + (2k + 2) * sz + (k - 1) * lds
+    for _ in (k + 2):n
+        bvr = _lhl_bcast(V, unsafe_load(pck))
+        bvi = _lhl_bcast(V, unsafe_load(pck, 2))
+        bpr = _lhl_bcast(V, -unsafe_load(prk))
+        bpi = _lhl_bcast(V, -unsafe_load(prk, 2))
+        a1 = _lhl_vload(V, pcol)
+        a1 = _lhl_vselect(ml, _lhl_fma(m1, bpi, _lhl_fma(l1, bpr, a1)), a1)
+        _lhl_vstore!(pcol, a1)
+        sr1 = _lhl_fma(a1, bvr, sr1)
+        si1 = _lhl_fma(a1, bvi, si1)
+        pcol += lds
+        prk += lds
+        pck += 2sz
+    end
+    pc = prow + k * lds
+    _lhl_vstore!(pc, _lhl_vadd(_lhl_vload(V, pc), _lhl_vselect(ma, _lhl_vadd(sr1, _lhl_vswapneg(si1)), z)))
+    return nothing
+end
+
 # Blocked (delayed-update) reduction.  Steps k0..kb form one panel.  Left transforms
 # N⁻¹ = I - l e_{k+1}ᵀ and row interchanges are applied to the panel's own columns at once
 # but to the trailing block T = A[:, kb+2:n] only at the panel end, as an interchange sweep,
@@ -698,10 +938,12 @@ end
 # panel wins because the trailing GEMV that dominates is independent of `nb` while the
 # per-step panel work grows with it.  With the row-block trailing update on the padded
 # `fstore` the unblocked reduction stays ahead up to n ≈ 500 (Float64) / 1000 (Float32);
-# with the generic sweeps and GEMM (ComplexF64) the two paths trade places between n ≈ 700
-# and 1300 depending on the Julia version.
+# with the explicit complex kernels the measured crossovers sit at n ≈ 500 (ComplexF64)
+# and 1024–1400 (ComplexF32), matching the real types of the same element size.
 _lhl_block_min(::Type{Float64}) = 500
 _lhl_block_min(::Type{Float32}) = 1024
+_lhl_block_min(::Type{ComplexF64}) = 512
+_lhl_block_min(::Type{ComplexF32}) = 1024
 _lhl_block_min(::Type{T}) where {T} = 768
 _lhl_panel_width(n::Int) = 16
 
@@ -735,7 +977,8 @@ end
 
 _lhl_thread_flag(::Val{B}) where {B} = B
 _lhl_thread_flag(b::Bool) = b
-_lhl_thread_min(::Type{T}) where {T} = T <: Union{Float32, Float64} ? _lhl_block_min(T) : typemax(Int)
+_lhl_thread_min(::Type{T}) where {T} =
+    T <: Union{Float32, Float64, ComplexF32, ComplexF64} ? _lhl_block_min(T) : typemax(Int)
 # Rows below which a panel step's row work stays on one thread.
 _lhl_thread_rows(::Type{T}) where {T} = 128
 _lhl_line(::Type{T}) where {T} = 64 ÷ sizeof(T)
@@ -796,9 +1039,9 @@ function _lhl_panel_steps!(
         end
         for k in k0:kb
             p = k + 1
-            amax = abs(A[k + 1, k])
+            amax = _lhl_pivmag(A[k + 1, k])
             for i in (k + 2):n
-                a = abs(A[i, k])
+                a = _lhl_pivmag(A[i, k])
                 if a > amax
                     amax = a
                     p = i
@@ -829,7 +1072,7 @@ function _lhl_panel_steps!(
                 end
             end
             kb + 2 <= n || continue
-            _lhl_gemv_cols!(w, A, k, k0 + 1, n, kb + 2, n)
+            _lhl_gemv_panel!(bk, nt, w, A, pack, k, k0 + 1, n, kb + 2, n)
             for kk in k0:k
                 q = ipiv[kk]
                 q != kk + 1 && ((w[kk + 1], w[q]) = (w[q], w[kk + 1]))
@@ -1343,7 +1586,7 @@ end
 
 function _lhl_swap_rows!(
         bk, A::StridedMatrix{T}, ipiv::Vector{Int}, k0::Int, kb::Int, c0::Int, c1::Int, nt::Int
-    ) where {T <: Union{Float32, Float64}}
+    ) where {T <: Union{Float32, Float64, ComplexF32, ComplexF64}}
     if nt == 1 || stride(A, 1) != 1 || c1 - c0 + 1 <= _LHL_GEMV_GROUP
         return invoke(
             _lhl_swap_rows!, Tuple{Any, AbstractMatrix, Any, Int, Int, Int, Int, Int},
@@ -1394,7 +1637,7 @@ end
 
 function _lhl_swap_deferred!(
         bk, A::StridedMatrix{T}, ipiv::Vector{Int}, nb::Int, nt::Int
-    ) where {T <: Union{Float32, Float64}}
+    ) where {T <: Union{Float32, Float64, ComplexF32, ComplexF64}}
     n = size(A, 2)
     if nt == 1 || stride(A, 1) != 1 || n - 2 < nb * nt
         return invoke(_lhl_swap_deferred!, Tuple{Any, AbstractMatrix, Any, Int, Int}, bk, A, ipiv, nb, nt)
@@ -1582,6 +1825,175 @@ end
     return nothing
 end
 
+# The generic panel's per-step GEMV.  The fallback is the plain column sweep; complex
+# float goes through fixed 64-column groups whose partials are combined in group order —
+# the partition and the order depend on the sizes only, so any thread count (including 1)
+# gives the same bits.
+function _lhl_gemv_panel!(
+        bk, nt::Int, w, A::AbstractMatrix{T}, pack, k::Int, r0::Int, r1::Int, c0::Int, c1::Int
+    ) where {T}
+    _lhl_gemv_cols!(w, A, k, r0, r1, c0, c1)
+    return nothing
+end
+
+function _lhl_gemv_panel!(
+        bk, nt::Int, w::Vector{T}, A::StridedMatrix{T}, pack::Vector{T}, k::Int,
+        r0::Int, r1::Int, c0::Int, c1::Int
+    ) where {T <: _LHL_CFloat}
+    if stride(A, 1) != 1
+        _lhl_gemv_cols!(w, A, k, r0, r1, c0, c1)
+        return nothing
+    end
+    Tr = real(T)
+    P = cld(c1 - c0 + 1, _LHL_GEMV_GROUP)
+    ldq = size(A, 2) + 8
+    sz = sizeof(Tr)
+    GC.@preserve w A pack begin
+        pw = Ptr{Tr}(pointer(w)) + 2 * (r0 - 1) * sz
+        pA = Ptr{Tr}(pointer(A))
+        ld = 2 * stride(A, 2)
+        pP = Ptr{Tr}(pointer(pack))
+        if nt > 1 && P > 1
+            _lhl_foreach_chunk!(bk, P) do p
+                ca, cb = _lhl_group(c0, c1, p)
+                _lhl_cgemv_group!(pP + 2 * (p - 1) * ldq * sz, pA, ld, k, r0, r1, ca, cb)
+            end
+        else
+            for p in 1:P
+                ca, cb = _lhl_group(c0, c1, p)
+                _lhl_cgemv_group!(pP + 2 * (p - 1) * ldq * sz, pA, ld, k, r0, r1, ca, cb)
+            end
+        end
+        # w = ((g₁ + g₂) + g₃) + … in group order
+        m = 2 * (r1 - r0 + 1)
+        @inbounds @simd ivdep for t in 1:m
+            unsafe_store!(pw, unsafe_load(pP, t), t)
+        end
+        for p in 2:P
+            pq = pP + 2 * (p - 1) * ldq * sz
+            @inbounds @simd ivdep for t in 1:m
+                unsafe_store!(pw, unsafe_load(pw, t) + unsafe_load(pq, t), t)
+            end
+        end
+    end
+    return nothing
+end
+
+# One group's partial q[1:r1-r0+1] = Σ_{j=ca}^{cb} A[j, k] · A[r0:r1, j] on the real view,
+# four columns per pass, the first pass assigning.  The four multipliers broadcast as
+# re/im scalars; the imaginary halves accumulate separately and are swap-negated into the
+# result once per vector (see the complex-kernel header comment).
+@inline function _lhl_cgemv_group!(
+        pq::Ptr{T}, pA::Ptr{T}, ld::Int, k::Int, r0::Int, r1::Int, ca::Int, cb::Int
+    ) where {T}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    lds = ld * sz
+    pk = pA + (k - 1) * lds
+    rl = 2 * (r1 - r0 + 1)
+    mb = (rl - rl % W) * sz
+    off = 2 * (r0 - 1) * sz
+    j = ca
+    if j + 3 <= cb
+        _lhl_cgemv_quad!(Val(true), V, pq, pA, lds, pk, j, off, mb, rl)
+        j += 4
+    else
+        _lhl_cgemv_one!(Val(true), V, pq, pA, lds, pk, j, off, mb, rl)
+        j += 1
+    end
+    while j + 3 <= cb
+        _lhl_cgemv_quad!(Val(false), V, pq, pA, lds, pk, j, off, mb, rl)
+        j += 4
+    end
+    while j <= cb
+        _lhl_cgemv_one!(Val(false), V, pq, pA, lds, pk, j, off, mb, rl)
+        j += 1
+    end
+    return nothing
+end
+
+@inline _lhl_cmul(j::Int, pk::Ptr{T}) where {T} =
+    Complex(unsafe_load(pk, 2j - 1), unsafe_load(pk, 2j))
+
+@inline function _lhl_cgemv_quad!(
+        ::Val{F}, ::Type{V}, pq::Ptr{T}, pA::Ptr{T}, lds::Int, pk::Ptr{T}, j::Int,
+        off::Int, mb::Int, rl::Int
+    ) where {F, W, T, V <: NTuple{W, VecElement{T}}}
+    sz = sizeof(T)
+    l1 = _lhl_cmul(j, pk); l2 = _lhl_cmul(j + 1, pk)
+    l3 = _lhl_cmul(j + 2, pk); l4 = _lhl_cmul(j + 3, pk)
+    br1 = _lhl_bcast(V, real(l1)); bi1 = _lhl_bcast(V, imag(l1))
+    br2 = _lhl_bcast(V, real(l2)); bi2 = _lhl_bcast(V, imag(l2))
+    br3 = _lhl_bcast(V, real(l3)); bi3 = _lhl_bcast(V, imag(l3))
+    br4 = _lhl_bcast(V, real(l4)); bi4 = _lhl_bcast(V, imag(l4))
+    p1 = pA + (j - 1) * lds + off
+    p2 = p1 + lds
+    p3 = p2 + lds
+    p4 = p3 + lds
+    z = _lhl_bcast(V, zero(T))
+    d = 0
+    while d < mb
+        a1 = _lhl_vload(V, p1 + d); a2 = _lhl_vload(V, p2 + d)
+        a3 = _lhl_vload(V, p3 + d); a4 = _lhl_vload(V, p4 + d)
+        t1 = _lhl_fma(a2, br2, _lhl_fma(a1, br1, z))
+        t1 = _lhl_fma(a4, br4, _lhl_fma(a3, br3, t1))
+        t2 = _lhl_fma(a2, bi2, _lhl_fma(a1, bi1, z))
+        t2 = _lhl_fma(a4, bi4, _lhl_fma(a3, bi3, t2))
+        t1 = _lhl_vadd(t1, _lhl_vswapneg(t2))
+        F || (t1 = _lhl_vadd(_lhl_vload(V, pq + d), t1))
+        _lhl_vstore!(pq + d, t1)
+        d += W * sz
+    end
+    t = mb ÷ (2 * sz) + 1
+    while 2t <= rl
+        a = _lhl_cmulld(p1, t) * l1 + _lhl_cmulld(p2, t) * l2 +
+            _lhl_cmulld(p3, t) * l3 + _lhl_cmulld(p4, t) * l4
+        F || (a += _lhl_cmulld(pq, t))
+        unsafe_store!(pq, real(a), 2t - 1)
+        unsafe_store!(pq, imag(a), 2t)
+        t += 1
+    end
+    return nothing
+end
+
+@inline function _lhl_cgemv_one!(
+        ::Val{F}, ::Type{V}, pq::Ptr{T}, pA::Ptr{T}, lds::Int, pk::Ptr{T}, j::Int,
+        off::Int, mb::Int, rl::Int
+    ) where {F, W, T, V <: NTuple{W, VecElement{T}}}
+    sz = sizeof(T)
+    l1 = _lhl_cmul(j, pk)
+    if !F && iszero(l1)
+        return nothing
+    end
+    br1 = _lhl_bcast(V, real(l1))
+    bi1 = _lhl_bcast(V, imag(l1))
+    p1 = pA + (j - 1) * lds + off
+    z = _lhl_bcast(V, zero(T))
+    d = 0
+    while d < mb
+        a1 = _lhl_vload(V, p1 + d)
+        t1 = _lhl_fma(a1, br1, z)
+        t2 = _lhl_fma(a1, bi1, z)
+        t1 = _lhl_vadd(t1, _lhl_vswapneg(t2))
+        F || (t1 = _lhl_vadd(_lhl_vload(V, pq + d), t1))
+        _lhl_vstore!(pq + d, t1)
+        d += W * sz
+    end
+    t = mb ÷ (2 * sz) + 1
+    while 2t <= rl
+        a = _lhl_cmulld(p1, t) * l1
+        F || (a += _lhl_cmulld(pq, t))
+        unsafe_store!(pq, real(a), 2t - 1)
+        unsafe_store!(pq, imag(a), 2t)
+        t += 1
+    end
+    return nothing
+end
+
+@inline _lhl_cmulld(p::Ptr{T}, t::Int) where {T} =
+    Complex(unsafe_load(p, 2t - 1), unsafe_load(p, 2t))
+
 # The deferred right updates of rows 1:k0 of the panel columns: from the panel columns
 # themselves, then A[1:k0, k0+1:kb+1] += A[1:k0, kb+2:n] * A[kb+2:n, k0:kb], one nb-wide K
 # chunk at a time.
@@ -1590,7 +2002,7 @@ function _lhl_top_gemm!(bk, A::AbstractMatrix{T}, k0::Int, kb::Int, nb::Int, pac
     _lhl_top_fix!(A, k0, kb, 1, k0)
     for kk in (kb + 2):nb:n
         ke = min(kk + nb - 1, n)
-        _lhl_gemm!(bk, A, 1, k0, kk, ke, kk, k0, k0 + 1, kb + 1, one(T), pack, 1)
+        _lhl_gemm!(bk, A, 1, k0, kk, ke, kk, k0, k0 + 1, kb + 1, one(T), pack, nt)
     end
     return nothing
 end
@@ -1911,6 +2323,77 @@ end
 end
 
 
+function _lhl_gemm!(
+        bk, A::StridedMatrix{T}, i0::Int, i1::Int, j0::Int, j1::Int, r0::Int,
+        cB::Int, c0::Int, c1::Int, sgn::T, pack::Array{T}, nt::Int
+    ) where {T <: _LHL_CFloat}
+    (i1 < i0 || j1 < j0 || c1 < c0) && return nothing
+    if stride(A, 1) == 1
+        _lhl_gemm_cmicro!(bk, A, i0, i1, j0, j1, r0, cB, c0, c1, sgn, pack, nt)
+    else
+        invoke(
+            _lhl_gemm!, Tuple{Any, AbstractMatrix{T}, Int, Int, Int, Int, Int, Int, Int, Int, T, Any, Int},
+            bk, A, i0, i1, j0, j1, r0, cB, c0, c1, sgn, pack, nt
+        )
+    end
+    return nothing
+end
+
+# The complex product through the real microkernel: column j of the packed multiplier
+# panel becomes two real columns — the interleaved values and their swap-negation — whose
+# matching two B rows are the re/im lanes of B's complex row j, which the interleaved
+# storage already lays out contiguously.  So C_rv += P_packed · B_rv runs the unmodified
+# real tiles with 2·rows rows and 2K inner length, B read from A in place: the same
+# 8·rows·cols·K real flops as four real GEMMs, with no shuffles and one pass over C.
+function _lhl_gemm_cmicro!(
+        bk, A::StridedMatrix{T}, i0::Int, i1::Int, j0::Int, j1::Int, r0::Int,
+        cB::Int, c0::Int, c1::Int, sgn::T, pack::Array{T}, nt::Int
+    ) where {T <: _LHL_CFloat}
+    Tr = real(T)
+    K = j1 - j0 + 1
+    rows = i1 - i0 + 1
+    rr = 2 * rows
+    ldp = rr % 256 == 0 ? rr + 8 : rr
+    2 * length(pack) >= ldp * 2K || throw(ArgumentError("LHL gemm scratch too small"))
+    sz = sizeof(Tr)
+    ld = 2 * stride(A, 2)
+    GC.@preserve A pack begin
+        pA = Ptr{Tr}(pointer(A))
+        pP = Ptr{Tr}(pointer(pack))
+        @inbounds for (jj, j) in enumerate(j0:j1)
+            pa = pP + (2jj - 2) * ldp * sz
+            pb = pP + (2jj - 1) * ldp * sz
+            for t in 1:rows
+                v = sgn * A[i0 + t - 1, j]
+                unsafe_store!(pa, real(v), 2t - 1)
+                unsafe_store!(pa, imag(v), 2t)
+                unsafe_store!(pb, -imag(v), 2t - 1)
+                unsafe_store!(pb, real(v), 2t)
+            end
+        end
+        pB = pA + ((cB - c0) * ld + 2 * (r0 - 1)) * sz
+        ia = 2 * i0 - 1
+        ib = 2 * i1
+        # Each C element takes its 2K FMAs in a fixed order whatever the partition, so
+        # both threaded splits are bit-identical to the serial call.
+        if nt > 1 && c1 - c0 + 1 > _LHL_GEMV_GROUP
+            P = cld(c1 - c0 + 1, _LHL_GEMV_GROUP)
+            _lhl_foreach_chunk!(bk, P) do p
+                ca, cb = _lhl_group(c0, c1, p)
+                _lhl_gemm_tiles!(pA, ld, pP, ldp, pB, 2K, ia, ib, ca, cb)
+            end
+        elseif nt > 1 && rr >= 4 * 384
+            _lhl_foreach_chunk!(bk, nt) do t
+                ra, rb = _lhl_chunk(ia, ib, t, nt, 384)
+                ra <= rb && _lhl_gemm_tiles!(pA, ld, pP + (ra - ia) * sz, ldp, pB, 2K, ra, rb, c0, c1)
+            end
+        else
+            _lhl_gemm_tiles!(pA, ld, pP, ldp, pB, 2K, ia, ib, c0, c1)
+        end
+    end
+    return nothing
+end
+
 # Rows k0+1:kb+1 of the trailing block T = A[:, kb+2:n] ← M⁻¹ · rows, M the unit lower
 # triangle of the panel's multipliers (M[i, k+1] = A[i, k] for i ≥ k+2, i.e. the panel's left
 # transforms restricted to its own rows).  Row k0+1 is unchanged.
@@ -2004,7 +2487,7 @@ end
 # columns at a time; threads take column chunks (Float32/Float64 on `Matrix` storage).
 function _lhl_ht_fill!(bk, Ht::Matrix{T}, A::AbstractMatrix{T}, n::Int, nt::Int) where {T}
     g = 8
-    if nt > 1 && n >= 4g * nt && T <: Union{Float32, Float64} && A isa Matrix{T}
+    if nt > 1 && n >= 4g * nt && T <: Union{Float32, Float64, ComplexF32, ComplexF64} && A isa Matrix{T}
         GC.@preserve Ht A begin
             pH = pointer(Ht)
             pA = pointer(A)
@@ -2063,13 +2546,30 @@ end
 """
     applyZ!(x, ws)
 
-`x ← Z x`.  `n²/2` multiply–adds.  Uses `ws.xbuf` as scratch, so not thread-safe on a
-shared workspace.
+`x ← Z x`.  `n²/2` multiply–adds.  Uses `ws.xbuf` (for a complex workspace, the shift's
+planar buffer) as scratch, so not thread-safe on a shared workspace.
 """
 function applyZ!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
     n = ws.n
     length(x) == n || throw(DimensionMismatch("x has length $(length(x)), the workspace is $n×$n"))
-    if eltype(x) === T
+    if T <: _LHL_CFloat && eltype(x) === T
+        sh = getfield(ws, :shift)
+        y = sh.xbuf
+        o = sh.po
+        @inbounds for i in 1:n
+            v = x[i]
+            y[i] = real(v)
+            y[o + i] = imag(v)
+        end
+        _lhl_zero_planes!(y, n, o)
+        _lhl_zsweep_bufc!(y, 0, o, ws.Lpp, n)
+        d = ws.scale
+        ip = ws.iperm
+        @inbounds for i in 1:n
+            p = ip[i]
+            x[i] = Complex(y[p], y[o + p]) * d[i]
+        end
+    elseif eltype(x) === T
         y = ws.xbuf
         @inbounds for i in 1:n
             y[i] = x[i]
@@ -2098,13 +2598,30 @@ end
 """
     applyZinv!(x, ws)
 
-`x ← Z⁻¹x`.  `n²/2` multiply–adds.  Uses `ws.xbuf` as scratch, so not thread-safe on a
-shared workspace.
+`x ← Z⁻¹x`.  `n²/2` multiply–adds.  Uses `ws.xbuf` (for a complex workspace, the shift's
+planar buffer) as scratch, so not thread-safe on a shared workspace.
 """
 function applyZinv!(x::AbstractVector, ws::LHLWorkspace{T}) where {T}
     n = ws.n
     length(x) == n || throw(DimensionMismatch("x has length $(length(x)), the workspace is $n×$n"))
-    if eltype(x) === T
+    if T <: _LHL_CFloat && eltype(x) === T
+        sh = getfield(ws, :shift)
+        y = sh.xbuf
+        o = sh.po
+        perm = ws.perm
+        isc = ws.iscale
+        @inbounds for i in 1:n
+            p = perm[i]
+            v = x[p] * isc[p]
+            y[i] = real(v)
+            y[o + i] = imag(v)
+        end
+        _lhl_zero_planes!(y, n, o)
+        _lhl_zinvsweep_bufc!(y, 0, o, ws.Lpp, n)
+        @inbounds for i in 1:n
+            x[i] = Complex(y[i], y[o + i])
+        end
+    elseif eltype(x) === T
         y = ws.xbuf
         _lhl_gather!(y, x, ws)
         _lhl_zinvsweep_buf!(y, 0, ws.Lp, n)
@@ -2434,6 +2951,185 @@ for P in (1, 2)
 end
 
 # ---------------------------------------------------------------------------
+# The same sweeps for a *complex* workspace: `y` holds the vector on two planes (offsets
+# `oa`, `ob`) and the multipliers come planar from `Lpp` (im plane `Lh` reals behind the
+# re plane, see `_lhl_lpack2!`), so every complex multiply–add is four real FMAs on plane
+# vectors with no lane shuffling.
+# ---------------------------------------------------------------------------
+
+# Group heads: the 3×3 triangle as scalar complex arithmetic on the planes; `h` points at
+# the re head slots, the im slots sit `Lo` bytes behind.
+@inline function _lhl_zinv_headc!(y::Vector{T}, oa::Int, ob::Int, k::Int, h::Ptr{T}, Lo::Int) where {T}
+    C = Complex{T}
+    @inbounds begin
+        x1 = C(y[oa + k + 1], y[ob + k + 1])
+        x2 = C(y[oa + k + 2], y[ob + k + 2]) - C(unsafe_load(h), unsafe_load(h + Lo)) * x1
+        y[oa + k + 2] = real(x2)
+        y[ob + k + 2] = imag(x2)
+        x3 = C(y[oa + k + 3], y[ob + k + 3]) - C(unsafe_load(h, 2), unsafe_load(h + Lo, 2)) * x1 -
+            C(unsafe_load(h, 3), unsafe_load(h + Lo, 3)) * x2
+        y[oa + k + 3] = real(x3)
+        y[ob + k + 3] = imag(x3)
+        x4 = C(y[oa + k + 4], y[ob + k + 4]) -
+            (C(unsafe_load(h, 4), unsafe_load(h + Lo, 4)) * x1 + C(unsafe_load(h, 5), unsafe_load(h + Lo, 5)) * x2) -
+            C(unsafe_load(h, 6), unsafe_load(h + Lo, 6)) * x3
+        y[oa + k + 4] = real(x4)
+        y[ob + k + 4] = imag(x4)
+    end
+    return x1, x2, x3, x4
+end
+
+@inline function _lhl_z_headc!(y::Vector{T}, oa::Int, ob::Int, k::Int, h::Ptr{T}, Lo::Int) where {T}
+    C = Complex{T}
+    @inbounds begin
+        x1 = C(y[oa + k + 1], y[ob + k + 1])
+        x2 = C(y[oa + k + 2], y[ob + k + 2])
+        x3 = C(y[oa + k + 3], y[ob + k + 3])
+        x4 = C(y[oa + k + 4], y[ob + k + 4])
+        v = x2 + C(unsafe_load(h), unsafe_load(h + Lo)) * x1
+        y[oa + k + 2] = real(v)
+        y[ob + k + 2] = imag(v)
+        v = x3 + C(unsafe_load(h, 2), unsafe_load(h + Lo, 2)) * x1 +
+            C(unsafe_load(h, 3), unsafe_load(h + Lo, 3)) * x2
+        y[oa + k + 3] = real(v)
+        y[ob + k + 3] = imag(v)
+        v = x4 + (C(unsafe_load(h, 4), unsafe_load(h + Lo, 4)) * x1 + C(unsafe_load(h, 5), unsafe_load(h + Lo, 5)) * x2) +
+            C(unsafe_load(h, 6), unsafe_load(h + Lo, 6)) * x3
+        y[oa + k + 4] = real(v)
+        y[ob + k + 4] = imag(v)
+    end
+    return x1, x2, x3, x4
+end
+
+# The body of a group: rows k+5:n of the four columns, planar multipliers against the
+# complex coefficients `c` (already sign-folded), both `y` planes updated per vector.
+@inline function _lhl_zbodyc!(
+        ::Type{V}, p::Ptr{T}, Lo::Int, pend::Ptr{T}, pa::Int, cs::Int, q::Ptr{T}, od::Int,
+        c::NTuple{4, Complex{T}}
+    ) where {W, T, V <: NTuple{W, VecElement{T}}}
+    br1 = _lhl_bcast(V, real(c[1])); bi1 = _lhl_bcast(V, imag(c[1])); bn1 = _lhl_bcast(V, -imag(c[1]))
+    br2 = _lhl_bcast(V, real(c[2])); bi2 = _lhl_bcast(V, imag(c[2])); bn2 = _lhl_bcast(V, -imag(c[2]))
+    br3 = _lhl_bcast(V, real(c[3])); bi3 = _lhl_bcast(V, imag(c[3])); bn3 = _lhl_bcast(V, -imag(c[3]))
+    br4 = _lhl_bcast(V, real(c[4])); bi4 = _lhl_bcast(V, imag(c[4])); bn4 = _lhl_bcast(V, -imag(c[4]))
+    while p < pend
+        v = _lhl_vload(V, q)
+        w = _lhl_vload(V, q + od)
+        lr = _lhl_vload(V, p)
+        li = _lhl_vload(V, p + Lo)
+        v = _lhl_fma(li, bn1, _lhl_fma(lr, br1, v))
+        w = _lhl_fma(li, br1, _lhl_fma(lr, bi1, w))
+        lr = _lhl_vload(V, p + cs)
+        li = _lhl_vload(V, p + cs + Lo)
+        v = _lhl_fma(li, bn2, _lhl_fma(lr, br2, v))
+        w = _lhl_fma(li, br2, _lhl_fma(lr, bi2, w))
+        lr = _lhl_vload(V, p + 2cs)
+        li = _lhl_vload(V, p + 2cs + Lo)
+        v = _lhl_fma(li, bn3, _lhl_fma(lr, br3, v))
+        w = _lhl_fma(li, br3, _lhl_fma(lr, bi3, w))
+        lr = _lhl_vload(V, p + 3cs)
+        li = _lhl_vload(V, p + 3cs + Lo)
+        v = _lhl_fma(li, bn4, _lhl_fma(lr, br4, v))
+        w = _lhl_fma(li, br4, _lhl_fma(lr, bi4, w))
+        _lhl_vstore!(q, v)
+        _lhl_vstore!(q + od, w)
+        p += pa
+        q += W * sizeof(T)
+    end
+    return nothing
+end
+
+# A single step (rows k+2:n of one column) on the planes.
+@inline function _lhl_zstepc!(
+        ::Type{V}, p::Ptr{T}, Lo::Int, pend::Ptr{T}, q::Ptr{T}, od::Int, c::Complex{T}
+    ) where {W, T, V <: NTuple{W, VecElement{T}}}
+    br = _lhl_bcast(V, real(c))
+    bi = _lhl_bcast(V, imag(c))
+    bn = _lhl_bcast(V, -imag(c))
+    while p < pend
+        v = _lhl_vload(V, q)
+        w = _lhl_vload(V, q + od)
+        lr = _lhl_vload(V, p)
+        li = _lhl_vload(V, p + Lo)
+        v = _lhl_fma(li, bn, _lhl_fma(lr, br, v))
+        w = _lhl_fma(li, br, _lhl_fma(lr, bi, w))
+        _lhl_vstore!(q, v)
+        _lhl_vstore!(q + od, w)
+        p += W * sizeof(T)
+        q += W * sizeof(T)
+    end
+    return nothing
+end
+
+function _lhl_zinvsweep_bufc!(y::Vector{T}, oa::Int, ob::Int, Lpp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    tiled = _lhl_tiled(n, T)
+    G = max(n - 2, 0) >> 2
+    Lo = (length(Lpp) >> 1) * sz
+    od = (ob - oa) * sz
+    GC.@preserve y Lpp begin
+        py = pointer(y) + oa * sz
+        h = pointer(Lpp)
+        @inbounds for g in 1:G
+            k = 4g - 3
+            x = _lhl_zinv_headc!(y, oa, ob, k, h, Lo)
+            c = (-x[1], -x[2], -x[3], -x[4])
+            p = h + _LHL_HEAD * sz
+            q = py + (k + 4) * sz
+            mpb = cld(n - k - 4, W) * W * sz
+            h = p + 4mpb
+            cs = tiled ? W * sz : mpb
+            pa = tiled ? 4W * sz : W * sz
+            pend = tiled ? h : p + mpb
+            _lhl_zbodyc!(V, p, Lo, pend, pa, cs, q, od, c)
+        end
+        @inbounds for k in (4G + 1):(n - 2)
+            ck = -Complex(y[oa + k + 1], y[ob + k + 1])
+            q = py + (k + 1) * sz
+            pend = h + cld(n - k - 1, W) * W * sz
+            _lhl_zstepc!(V, h, Lo, pend, q, od, ck)
+            h = pend
+        end
+    end
+    return y
+end
+
+function _lhl_zsweep_bufc!(y::Vector{T}, oa::Int, ob::Int, Lpp::Vector{T}, n::Int) where {T <: Union{Float32, Float64}}
+    V = _lhl_vectype(T)
+    W = _LHL_VEC_BYTES ÷ sizeof(T)
+    sz = sizeof(T)
+    tiled = _lhl_tiled(n, T)
+    G = max(n - 2, 0) >> 2
+    Lo = (length(Lpp) >> 1) * sz
+    od = (ob - oa) * sz
+    GC.@preserve y Lpp begin
+        py = pointer(y) + oa * sz
+        h = pointer(Lpp) + (length(Lpp) >> 1) * sz
+        @inbounds for k in (n - 2):-1:(4G + 1)
+            ck = Complex(y[oa + k + 1], y[ob + k + 1])
+            m = cld(n - k - 1, W) * W
+            h -= m * sz
+            q = py + (k + 1) * sz
+            _lhl_zstepc!(V, h, Lo, h + m * sz, q, od, ck)
+        end
+        @inbounds for g in G:-1:1
+            k = 4g - 3
+            h -= _lhl_group_size(n, k, W) * sz
+            c = _lhl_z_headc!(y, oa, ob, k, h, Lo)
+            p = h + _LHL_HEAD * sz
+            q = py + (k + 4) * sz
+            mpb = cld(n - k - 4, W) * W * sz
+            cs = tiled ? W * sz : mpb
+            pa = tiled ? 4W * sz : W * sz
+            pend = tiled ? p + 4mpb : p + mpb
+            _lhl_zbodyc!(V, p, Lo, pend, pa, cs, q, od, c)
+        end
+    end
+    return y
+end
+
+# ---------------------------------------------------------------------------
 # The γ-dependent half
 # ---------------------------------------------------------------------------
 
@@ -2514,8 +3210,8 @@ end
     return v
 end
 
-# Pivot magnitude: |re| + |im| for complex pivots, as LAPACK's izamax — no square root and
-# no overflow, and within √2 of the modulus.
+# Pivot magnitude (reduction and shift) and balance norm: |re| + |im| for complex values,
+# as LAPACK's izamax/CABS1 — no square root and no overflow, and within √2 of the modulus.
 @inline _lhl_pivmag(x::Real) = abs(x)
 @inline _lhl_pivmag(x::Complex) = abs(real(x)) + abs(imag(x))
 
@@ -3105,6 +3801,25 @@ function lhl_ldiv!(x::AbstractVector, sh::LHLShift{Complex{Tr}, Tr}, ws::LHLWork
             p = ip[i]
             x[i] = Complex(y[p], y[o + p]) * d[i]
         end
+    elseif T <: _LHL_CFloat && eltype(x) === Complex{Tr}
+        perm = ws.perm
+        isc = ws.iscale
+        @inbounds for i in 1:n
+            p = perm[i]
+            v = x[p] * isc[p]
+            y[i] = real(v)
+            y[o + i] = imag(v)
+        end
+        _lhl_zero_planes!(y, n, o)
+        _lhl_zinvsweep_bufc!(y, 0, o, ws.Lpp, n)
+        _hessenberg_solve_planar!(y, sh)
+        _lhl_zsweep_bufc!(y, 0, o, ws.Lpp, n)
+        d = ws.scale
+        ip = ws.iperm
+        @inbounds for i in 1:n
+            p = ip[i]
+            x[i] = Complex(y[p], y[o + p]) * d[i]
+        end
     else
         applyZinv!(x, ws)
         @inbounds for i in 1:n
@@ -3165,8 +3880,9 @@ not modified; [`lhl!`](@ref) reuses an existing workspace instead of allocating 
 `shift` is the element type of the shifts and solves; `Complex{eltype(J)}` on a real `J`
 keeps the reduction real and makes only the shifted half complex (see [`LHLShift`](@ref)).
 
-`thread = Val(true)` lets the blocked reduction (`n ≥ 500` for `Float64`, `1024` for
-`Float32`; other element types stay serial) run on Polyester threads; threading requires
+`thread = Val(true)` lets the blocked reduction (`n ≥ 500` for `Float64`, `512` for
+`ComplexF64`, `1024` for `Float32` and `ComplexF32`; other element types stay serial) run
+on Polyester threads; threading requires
 `using Polyester` (which loads the `LHLFactorizationPolyesterExt` extension) and
 `julia -t N` — without either, `Val(true)` silently runs the serial code.  `Val(false)`
 (or `false`) keeps it single-threaded.  The threaded work is partitioned independently of
@@ -3214,6 +3930,19 @@ if ccall(:jl_generating_output, Cint, ()) == 1
                 lhl_shift!(sh, ws, one(T), Complex{T}(0, 1) / 8)
                 lhl_ldiv!(Complex{T}.(b), sh, ws)
             end
+        end
+        for T in (ComplexF64, ComplexF32)
+            n = 48
+            J = T[1 / (i + j) + (i == j) * (1 + im) for i in 1:n, j in 1:n]
+            ws = lhl(J)
+            lhl!(ws, J; thread = Val(false))
+            _lhl_reduce_blocked!(LHLSerial(), ws.fstore, ws.ipiv, ws.Ht, ws.work, ws.pack, 16, 2)
+            lhl_shift!(ws, one(T), T(-1 // 8, 1 // 16))
+            b = ones(T, n)
+            x = lhl_ldiv!(copy(b), ws)
+            lhl_refine!(x, J, b, ws, 1)
+            applyZinv!(x, ws)
+            applyZ!(x, ws)
         end
     end
 end
