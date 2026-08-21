@@ -41,6 +41,24 @@ lhl_refine!(x, A, b, ws, 1)
 @assert A * x ≈ b
 ```
 
+## Adjoint solves
+
+The reduction already contains everything an adjoint solve needs: `W = Z G Z⁻¹` gives
+`Wᴴ = Z⁻ᴴ Gᴴ Zᴴ`, so [`lhl_ldivH!`](@ref) solves `Wᴴ x = b` in the same three `O(n²)`
+phases against the same reduction and the same shift LU — nothing is refactorized. That
+is what a reverse-mode sweep through a stiff solve wants on its backward pass.
+[`lhl_refineH!`](@ref) refines it (the residual is formed with a lazy `A'`), and
+[`applyZH!`](@ref) / [`applyZinvH!`](@ref) apply the adjoint similarity on its own. On a
+real reduction `Zᴴ = Zᵀ` stays real even under a complex shift; only the shifted half
+conjugates.
+
+```@example quickstart
+lhl_shift!(ws, 1.0, -γ)
+xh = lhl_ldivH!(copy(b), ws)
+lhl_refineH!(xh, A, b, ws, 1)
+@assert A' * xh ≈ b
+```
+
 ## Complex shifts on a real reduction
 
 A Radau-type implicit Runge–Kutta step needs one real and one complex shift against the

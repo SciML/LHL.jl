@@ -89,3 +89,32 @@ end
     end
     @test ws.info == 0
 end
+
+@testset "generic adjoint solves and transformations" begin
+    J = randn(8, 8)
+    b = randn(8)
+    ws = lhl(view(J, :, :))
+    lhl_shift!(ws, 1.0, -0.1)
+    W = Matrix(I - 0.1 * J)
+
+    x = lhl_ldivH!(copy(b), ws)
+    @test x ≈ W' \ b
+    @test lhl_ldivH!(view(copy(b), :), ws) ≈ x
+    @test lhl_refineH!(copy(x), W, b, ws, 1) ≈ W' \ b rtol = 1.0e-10
+
+    x0 = randn(8)
+    transformed = copy(x0)
+    @test applyZH!(transformed, ws) === transformed
+    @test applyZinvH!(transformed, ws) === transformed
+    @test transformed ≈ x0
+
+    # a complex shift held against the real reduction
+    sh = LHLShift{ComplexF64}(ws)
+    τ = -0.05 + 0.02im
+    lhl_shift!(sh, ws, 1.0, τ)
+    Wc = Matrix(I + τ * J)
+    zc = lhl_ldivH!(ComplexF64.(b), sh, ws)
+    @test zc ≈ Wc' \ b
+    @test lhl_refineH!(zc, Wc, ComplexF64.(b), sh, ws, 1) === zc
+    @test Wc' * zc ≈ b rtol = 1.0e-10
+end
